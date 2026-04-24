@@ -19,7 +19,7 @@ import React, { useEffect, useState, VFC } from "react";
 import { FaRocket } from "react-icons/fa";
 
 import { registerLibraryPatch } from "./hooks/libraryPatch";
-import { bypassAndLaunch } from "./launch/gameLauncher";
+import { prepareBypass, bypassAndLaunch } from "./launch/gameLauncher";
 import { startRunningAppsTracker } from "./launch/appStateChecker";
 import {
   isEnabled,
@@ -104,8 +104,19 @@ export default definePlugin(() => {
 
   /**
    * Fired by libraryPatch whenever the Steam router navigates to a
-   * game detail page.  Immediately launches the game and navigates
-   * back, bypassing the detail page entirely.
+   * game detail page.
+   *
+   * This function is called synchronously from within the history
+   * listener / route-patch callback, so everything before the first
+   * `await` runs in the same call-stack as the navigation event.
+   *
+   * Step 1 – prepareBypass() [synchronous]:
+   *   Checks install state, shows any needed toast, and calls
+   *   NavigateBack() immediately so the overview page never renders.
+   *
+   * Step 2 – bypassAndLaunch() [async, fire-and-forget]:
+   *   Issues the RunGame command (and, in a future task, retries if
+   *   the API is not yet ready).
    */
   function onGameSelected(appId: number): void {
     if (!isEnabled()) {
@@ -115,8 +126,12 @@ export default definePlugin(() => {
       return;
     }
 
-    // Fire-and-forget: bypassAndLaunch is async but must not block the
-    // route patch / history listener callback.
+    // Step 1: synchronous — NavigateBack fires here, in the same
+    // call-stack as the history listener, before any await.
+    const shouldLaunch = prepareBypass(appId);
+    if (!shouldLaunch) return;
+
+    // Step 2: async — RunGame (may add a retry delay in a future task).
     bypassAndLaunch(appId).catch((err) => {
       console.error(`[QuickLaunch] bypassAndLaunch failed for appId=${appId}:`, err);
     });

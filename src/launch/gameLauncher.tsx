@@ -11,8 +11,8 @@
  * 2. Handle the state:
  *      - not_installed  → abort bypass; show toast; let detail page stay
  *      - already_running / update_required / launchable / unknown
- *                       → issue RunGame + navigate to /library
- * 3. Primary launch: window.SteamClient.Apps.RunGame()
+ *                       → issue RunGame first, then navigate to /library
+ * 3. Primary launch: window.SteamClient.Apps.RunGame()  ← called BEFORE NavigateBack
  *    Fallback launch:  steam://rungameid/<appId> URL scheme
  *
  * Launch type constants
@@ -39,12 +39,10 @@ import {
 // ------------------------------------------------------------------ //
 
 /**
- * Milliseconds to wait after issuing RunGame before navigating back.
- * A small pause ensures Steam registers the launch before the UI transitions.
+ * Suppress duplicate launches for the **same** appId within this window.
+ * A different appId passes through immediately so rapid A-presses on
+ * two different games are never swallowed.
  */
-const NAV_DELAY_MS = 80;
-
-/** Debounce window – ignores repeated calls within this many ms. */
 const DEBOUNCE_MS = 500;
 
 // ------------------------------------------------------------------ //
@@ -132,27 +130,37 @@ function toastUpdating(): void {
 // Debounce guard                                                       //
 // ------------------------------------------------------------------ //
 
-let _lastLaunchAt = 0;
+let _lastLaunchAppId = -1;
+let _lastLaunchAt    = 0;
 
 // ------------------------------------------------------------------ //
 // Public API                                                           //
 // ------------------------------------------------------------------ //
 
 /**
- * Check the game's launch state, then either:
- *   • abort (not installed) – show toast, leave detail page visible, or
- *   • bypass – launch via RunGame / URL scheme + navigate to /library.
+ * Synchronous first half of the bypass.
  *
- * @param appId  The Steam appId of the selected game.
+ * Checks the app's launch state, shows any appropriate toast, and —
+ * when the game is launchable — calls NavigateBack() immediately so
+ * the detail page is dismissed before React finishes rendering it.
+ *
+ * Must be called in the same synchronous call-stack as the history
+ * listener or route-patch callback (i.e. before any `await`).
+ *
+ * @returns `true` if the caller should proceed to launch the game,
+ *          `false` if the bypass was aborted (game not installed).
  */
-export async function bypassAndLaunch(appId: number): Promise<void> {
-  // Debounce: ignore rapid repeated calls for the same navigation event.
+export function prepareBypass(appId: number): boolean {
+  // Per-appId debounce: suppress only if the same game fires again
+  // within the window (e.g. history-listen + routerHook both trigger).
+  // A different appId always bypasses the guard immediately.
   const now = Date.now();
-  if (now - _lastLaunchAt < DEBOUNCE_MS) {
-    console.log(`[QuickLaunch] bypassAndLaunch debounced for appId=${appId}.`);
-    return;
+  if (appId === _lastLaunchAppId && now - _lastLaunchAt < DEBOUNCE_MS) {
+    console.log(`[QuickLaunch] prepareBypass debounced for appId=${appId}.`);
+    return false;
   }
-  _lastLaunchAt = now;
+  _lastLaunchAppId = appId;
+  _lastLaunchAt    = now;
 
   // ── Classify the app ─────────────────────────────────────────────
   const state = getAppLaunchState(appId);
@@ -161,39 +169,61 @@ export async function bypassAndLaunch(appId: number): Promise<void> {
   // ── Handle each state ────────────────────────────────────────────
   switch (state) {
     case "not_installed":
-      // Do NOT bypass: let the detail page stay so the user can install.
+      // Abort: keep the detail page visible so the user can install.
       toastNotInstalled();
-      return; // early exit – no launch, no navigation
+      return false;
 
     case "already_running":
-      // Game is running: RunGame will resume the session (bring it to focus).
-      // Still navigate away from the detail page so the library reappears.
       toastResuming();
-      break; // fall through to launch
+      break;
 
     case "update_required":
-      // Steam will download the update then auto-launch.  Let it proceed.
       toastUpdating();
-      break; // fall through to launch
+      break;
 
     case "launchable":
     case "unknown":
     default:
-      // Normal launch or unable to determine state → proceed optimistically.
       break;
   }
 
-  // ── Navigate away first, THEN launch ────────────────────────────
-  // Calling NavigateBack() before RunGame dismisses the detail page
-  // immediately; the game launches in the background regardless.
+  // ── Navigate back synchronously ───────────────────────────────────
+  // Called here — before any await — so the overview page never
+  // finishes rendering.  The game launch follows in bypassAndLaunch().
   navigateToLibrary();
+  return true;
+}
 
-  // Brief pause so the navigation commits before RunGame fires.
-  await sleep(NAV_DELAY_MS);
+/**
+ * Async second half of the bypass: issues the RunGame command.
+ *
+ * Must be called only after prepareBypass() returns true.
+ *
+ * Launch sequence:
+ *   1. Try SteamClient.Apps.RunGame() immediately.
+ *   2. If the API is not yet available, wait 200 ms and try once more.
+ *   3. If both attempts fail, fall back to the steam://rungameid/ URL scheme.
+ *
+ * The retry handles the case where SteamClient is still initialising
+ * when the plugin IIFE first runs; NavigateBack has already fired
+ * synchronously so this delay never affects the UI transition.
+ *
+ * @param appId  The Steam appId of the game to launch.
+ */
+export async function bypassAndLaunch(appId: number): Promise<void> {
+  // ── Attempt 1 ────────────────────────────────────────────────────
+  if (tryRunGameAPI(appId)) return;
 
-  // ── Issue the launch command ──────────────────────────────────────
-  const apiOk = tryRunGameAPI(appId);
-  if (!apiOk) {
-    tryUrlSchemeFallback(appId);
-  }
+  // ── Retry after 200 ms ───────────────────────────────────────────
+  // NavigateBack already ran synchronously, so this delay is invisible
+  // to the user.  SteamClient may simply not have been ready yet.
+  console.log(`[QuickLaunch] RunGame unavailable for appId=${appId} – retrying in 200 ms.`);
+  await sleep(200);
+
+  // ── Attempt 2 ────────────────────────────────────────────────────
+  if (tryRunGameAPI(appId)) return;
+
+  // ── Fallback – steam:// URL scheme ───────────────────────────────
+  console.warn(`[QuickLaunch] RunGame still unavailable for appId=${appId} – using URL fallback.`);
+  tryUrlSchemeFallback(appId);
 }

@@ -32,16 +32,23 @@ const GAME_ROUTE_RE =
   /^(?:\/library\/app\/|\/appdetails\/)(\d+)/;
 
 // ------------------------------------------------------------------ //
-// Debounce guard                                                       //
+// Debounce guard (per-appId)                                          //
 // ------------------------------------------------------------------ //
 
-let _lastFiredAt = 0;
+/**
+ * Suppress duplicate fires for the **same** appId within this window.
+ * A different appId always passes through immediately so that rapid
+ * A-presses on two different games are never swallowed.
+ */
 const DEBOUNCE_MS = 600;
+let _lastFiredAppId = -1;
+let _lastFiredAt   = 0;
 
 function fire(appId: number, source: string): void {
   const now = Date.now();
-  if (now - _lastFiredAt < DEBOUNCE_MS) return;
-  _lastFiredAt = now;
+  if (appId === _lastFiredAppId && now - _lastFiredAt < DEBOUNCE_MS) return;
+  _lastFiredAppId = appId;
+  _lastFiredAt    = now;
   console.log(`[QuickLaunch] bypass triggered appId=${appId} via ${source}`);
   notifyGameSelected(appId);
 }
