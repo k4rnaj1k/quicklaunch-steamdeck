@@ -28,9 +28,8 @@ import { Navigation } from "@decky/ui";
 import { FaRocket } from "react-icons/fa";
 import { getAppLaunchState } from "./appStateChecker";
 import {
+  LAUNCH_TYPE_DEFAULT,
   LAUNCH_TYPE_GAME,
-  LAUNCH_TYPE_SHORTCUT,
-  isNonSteamShortcut,
   launchTypeFor,
 } from "../utils/launchUtils";
 
@@ -63,9 +62,15 @@ function tryRunGameAPI(appId: number): boolean {
       console.warn("[QuickLaunch] SteamClient.Apps.RunGame unavailable – falling back.");
       return false;
     }
+    // arg 3 = LAUNCH_TYPE_DEFAULT (-1): always let Steam choose the launch option.
+    // arg 4 = launchTypeFor(appId):     100 for Steam games, 104 for non-Steam shortcuts.
     const type = launchTypeFor(appId);
-    console.log(`[QuickLaunch] RunGame: appId=${appId} launchType=${type}`);
-    window.SteamClient.Apps.RunGame(String(appId), "", type, LAUNCH_TYPE_GAME);
+    console.log(
+      `[QuickLaunch] RunGame call: appId=${appId}` +
+      ` arg3(launchOptionIndex)=${LAUNCH_TYPE_DEFAULT}` +
+      ` arg4(launchType)=${type}`
+    );
+    window.SteamClient.Apps.RunGame(String(appId), "", LAUNCH_TYPE_DEFAULT, type);
     return true;
   } catch (err) {
     console.error("[QuickLaunch] RunGame threw:", err);
@@ -126,6 +131,15 @@ function toastUpdating(): void {
   });
 }
 
+function toastLaunching(): void {
+  toaster.toast({
+    title: "QuickLaunch",
+    body: "Launching…",
+    icon: <FaRocket />,
+    duration: 2000,
+  });
+}
+
 // ------------------------------------------------------------------ //
 // Debounce guard                                                       //
 // ------------------------------------------------------------------ //
@@ -141,16 +155,21 @@ let _lastLaunchAt    = 0;
  * Synchronous first half of the bypass.
  *
  * Checks the app's launch state, shows any appropriate toast, and —
- * when the game is launchable — calls NavigateBack() immediately so
- * the detail page is dismissed before React finishes rendering it.
+ * when navigateBack is true — calls NavigateBack() immediately so the
+ * overview page is dismissed before React finishes rendering it.
  *
- * Must be called in the same synchronous call-stack as the history
- * listener or route-patch callback (i.e. before any `await`).
+ * Pass navigateBack=false when the caller has already blocked the
+ * history push so the overview was never entered; NavigateBack is then
+ * unnecessary and would pop the wrong entry.
  *
+ * Must be called in the same synchronous call-stack as the interception
+ * point (history.push patch or history.listen callback).
+ *
+ * @param navigateBack  Whether to call NavigateBack() (default true).
  * @returns `true` if the caller should proceed to launch the game,
  *          `false` if the bypass was aborted (game not installed).
  */
-export function prepareBypass(appId: number): boolean {
+export function prepareBypass(appId: number, navigateBack = true): boolean {
   // Per-appId debounce: suppress only if the same game fires again
   // within the window (e.g. history-listen + routerHook both trigger).
   // A different appId always bypasses the guard immediately.
@@ -184,13 +203,17 @@ export function prepareBypass(appId: number): boolean {
     case "launchable":
     case "unknown":
     default:
+      // Normal launch – confirm to the user that the bypass fired.
+      toastLaunching();
       break;
   }
 
-  // ── Navigate back synchronously ───────────────────────────────────
-  // Called here — before any await — so the overview page never
-  // finishes rendering.  The game launch follows in bypassAndLaunch().
-  navigateToLibrary();
+  // ── Navigate back synchronously (fallback strategies only) ──────────
+  // When the history.push was blocked upstream, the user never left the
+  // current page so NavigateBack is not needed (and would be wrong).
+  if (navigateBack) {
+    navigateToLibrary();
+  }
   return true;
 }
 

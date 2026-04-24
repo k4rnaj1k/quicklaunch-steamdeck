@@ -16,11 +16,23 @@
 export const NON_STEAM_APPID_THRESHOLD = 0x80000000; // 2 147 483 648
 
 /**
- * launchType constants passed to SteamClient.Apps.RunGame.
- * These mirror the values the Steam UI uses internally.
+ * launchType constants for the 4th argument of SteamClient.Apps.RunGame.
+ *
+ * RunGame signature (as observed from Steam's internal UI code):
+ *   RunGame(appId: string, launchData: string, launchOptionIndex: number, launchType: number)
+ *
+ *   launchOptionIndex (arg 3):
+ *     -1  → LAUNCH_TYPE_DEFAULT: let Steam pick the launch option (always correct)
+ *
+ *   launchType (arg 4):
+ *     100 → LAUNCH_TYPE_GAME:     standard Steam game / Proton title
+ *     104 → LAUNCH_TYPE_SHORTCUT: non-Steam shortcut added via "Add Non-Steam Game"
+ *
+ * Always use LAUNCH_TYPE_DEFAULT for arg 3.  Use launchTypeFor() for arg 4.
  */
-export const LAUNCH_TYPE_GAME = 100;     // Standard Steam game / Proton
-export const LAUNCH_TYPE_SHORTCUT = 104; // Non-Steam shortcut
+export const LAUNCH_TYPE_DEFAULT  = -1;  // arg 3: always use this (let Steam decide)
+export const LAUNCH_TYPE_GAME     = 100; // arg 4: standard Steam game / Proton
+export const LAUNCH_TYPE_SHORTCUT = 104; // arg 4: non-Steam shortcut
 
 /**
  * Returns true when the given appId belongs to a non-Steam shortcut.
@@ -30,7 +42,13 @@ export const LAUNCH_TYPE_SHORTCUT = 104; // Non-Steam shortcut
  * rather than the standard 100.
  */
 export function isNonSteamShortcut(appId: number): boolean {
-  return appId >= NON_STEAM_APPID_THRESHOLD;
+  const result = appId >= NON_STEAM_APPID_THRESHOLD;
+  console.log(
+    `[QuickLaunch] isNonSteamShortcut: appId=${appId} (0x${appId.toString(16).toUpperCase()})` +
+    ` threshold=0x${NON_STEAM_APPID_THRESHOLD.toString(16).toUpperCase()}` +
+    ` → ${result ? "NON-STEAM SHORTCUT" : "steam game"}`
+  );
+  return result;
 }
 
 /**
@@ -41,5 +59,11 @@ export function isNonSteamShortcut(appId: number): boolean {
  * - Non-Steam shortcuts:                          104
  */
 export function launchTypeFor(appId: number): number {
-  return isNonSteamShortcut(appId) ? LAUNCH_TYPE_SHORTCUT : LAUNCH_TYPE_GAME;
+  const type = isNonSteamShortcut(appId) ? LAUNCH_TYPE_SHORTCUT : LAUNCH_TYPE_GAME;
+  console.log(
+    `[QuickLaunch] launchTypeFor: appId=${appId}` +
+    ` → launchType=${type}` +
+    ` (${type === LAUNCH_TYPE_SHORTCUT ? "SHORTCUT/104" : "GAME/100"})`
+  );
+  return type;
 }

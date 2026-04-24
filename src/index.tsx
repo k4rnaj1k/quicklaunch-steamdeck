@@ -118,23 +118,28 @@ export default definePlugin(() => {
    *   Issues the RunGame command (and, in a future task, retries if
    *   the API is not yet ready).
    */
-  function onGameSelected(appId: number): void {
+  /**
+   * @param navigate  true  → navigation already committed; must NavigateBack.
+   *                  false → push was blocked; skip NavigateBack.
+   * @returns true if bypass was applied, false if aborted.
+   */
+  function onGameSelected(appId: number, navigate: boolean): boolean {
     if (!isEnabled()) {
       console.log(
         `[QuickLaunch] Game ${appId} selected but plugin is disabled – passing through.`
       );
-      return;
+      return false;
     }
 
-    // Step 1: synchronous — NavigateBack fires here, in the same
-    // call-stack as the history listener, before any await.
-    const shouldLaunch = prepareBypass(appId);
-    if (!shouldLaunch) return;
+    // Step 1: synchronous — state-check, toast, optional NavigateBack.
+    const shouldLaunch = prepareBypass(appId, navigate);
+    if (!shouldLaunch) return false;
 
-    // Step 2: async — RunGame (may add a retry delay in a future task).
+    // Step 2: async — RunGame with retry.
     bypassAndLaunch(appId).catch((err) => {
       console.error(`[QuickLaunch] bypassAndLaunch failed for appId=${appId}:`, err);
     });
+    return true;
   }
 
   // ---------------------------------------------------------------- //

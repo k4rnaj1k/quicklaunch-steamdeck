@@ -18,8 +18,15 @@
 
 export type AppId = number;
 
-/** Fired whenever the user navigates to a game's detail page. */
-export type GameSelectedListener = (appId: AppId) => void;
+/**
+ * Fired whenever the user navigates to a game's detail page.
+ *
+ * @param navigate  true  → caller could not block the navigation; listener
+ *                         must call NavigateBack() to dismiss the overview.
+ *                  false → caller blocked the push; no NavigateBack needed.
+ * @returns true if the bypass was applied, false if it was aborted.
+ */
+export type GameSelectedListener = (appId: AppId, navigate: boolean) => boolean;
 
 /** Fired whenever the `enabled` flag changes. */
 export type EnabledChangeListener = (enabled: boolean) => void;
@@ -36,6 +43,7 @@ let _enabled = true;
 
 /** Registered listener – only one at a time is needed for this plugin. */
 let _onGameSelected: GameSelectedListener | null = null;
+
 
 /** Subscribers notified on every enabled-state change. */
 const _enabledListeners = new Set<EnabledChangeListener>();
@@ -85,12 +93,15 @@ export function subscribeToEnabled(fn: EnabledChangeListener): () => void {
 
 /**
  * Called by the library route patcher when a game's detail page is
- * entered.  Stores the appId and fires the registered listener.
+ * about to be (or has been) entered.
+ *
+ * @param navigate  Passed through to the listener; see GameSelectedListener.
+ * @returns The boolean returned by the listener, or false if no listener.
  */
-export function notifyGameSelected(appId: AppId): void {
+export function notifyGameSelected(appId: AppId, navigate: boolean): boolean {
   _lastSelectedAppId = appId;
-  console.log(`[QuickLaunch] Game selected: appId=${appId}`);
-  _onGameSelected?.(appId);
+  console.log(`[QuickLaunch] Game selected: appId=${appId} navigate=${navigate}`);
+  return _onGameSelected?.(appId, navigate) ?? false;
 }
 
 /** Register the single game-selection listener (replaces any previous one). */

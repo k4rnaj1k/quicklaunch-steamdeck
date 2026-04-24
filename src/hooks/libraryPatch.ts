@@ -4,16 +4,21 @@
  * Detects when the Steam UI navigates to a game's detail page and fires
  * notifyGameSelected() so the bypass logic can run.
  *
- * Two complementary detection strategies are used so that at least one
- * fires on every SteamOS/Decky version combination:
+ * Three complementary detection strategies are layered so that at least
+ * one fires on every SteamOS/Decky version combination:
  *
- *   1. Router.history.listen()   – hooks into the React-Router MemoryHistory
- *      directly.  Fires on every pathname change including home-screen taps.
- *      This is the most reliable strategy on Decky / @decky/ui ≥ 4.x.
+ *   0. Router.history.push patch – intercepts the push *before* the
+ *      location commits.  The push is swallowed for launchable games so
+ *      the overview page is never entered and NavigateBack is not needed.
+ *      Best strategy; eliminates the overview flash entirely.
+ *
+ *   1. Router.history.listen()   – fires *after* the location changes.
+ *      NavigateBack() is required to dismiss the overview.  Fallback when
+ *      Strategy 0 is unavailable or when Strategy 0 lets the push through
+ *      (not-installed case handled upstream; debounce blocks double-fire).
  *
  *   2. routerHook.addPatch()     – patches the /library/app/:appid route's
- *      render tree.  Fires at render time and provides the appId from the
- *      route params.  Acts as backup when history.listen is unavailable.
+ *      render tree.  Fires at render time.  Last-resort fallback.
  */
 
 import { routerHook } from "@decky/api";
@@ -44,13 +49,21 @@ const DEBOUNCE_MS = 600;
 let _lastFiredAppId = -1;
 let _lastFiredAt   = 0;
 
-function fire(appId: number, source: string): void {
+/**
+ * Debounce-guarded notification.
+ *
+ * @param navigate  Forwarded to notifyGameSelected / prepareBypass.
+ *                  false = push was blocked (no NavigateBack needed).
+ *                  true  = navigation already committed (NavigateBack needed).
+ * @returns The boolean returned by the game-selected listener.
+ */
+function fire(appId: number, source: string, navigate: boolean): boolean {
   const now = Date.now();
-  if (appId === _lastFiredAppId && now - _lastFiredAt < DEBOUNCE_MS) return;
+  if (appId === _lastFiredAppId && now - _lastFiredAt < DEBOUNCE_MS) return false;
   _lastFiredAppId = appId;
   _lastFiredAt    = now;
-  console.log(`[QuickLaunch] bypass triggered appId=${appId} via ${source}`);
-  notifyGameSelected(appId);
+  console.log(`[QuickLaunch] bypass triggered appId=${appId} via ${source} navigate=${navigate}`);
+  return notifyGameSelected(appId, navigate);
 }
 
 // ------------------------------------------------------------------ //
@@ -95,7 +108,7 @@ function patchLibraryRoute(tree: unknown): unknown {
   // ── Approach 1: extractAppId on tree root (React Router v5/v6) ────
   const appIdFromRoot = extractAppId([tree]);
   if (appIdFromRoot && appIdFromRoot > 0) {
-    fire(appIdFromRoot, "tree-root");
+    fire(appIdFromRoot, "tree-root", true);
     return tree;
   }
 
@@ -106,7 +119,7 @@ function patchLibraryRoute(tree: unknown): unknown {
     routeNode["renderFunc"] = function (...args: unknown[]) {
       const ret = original.apply(this as unknown, args);
       const appId = extractAppId(args);
-      if (appId && appId > 0) fire(appId, "renderFunc-args");
+      if (appId && appId > 0) fire(appId, "renderFunc-args", true);
       return ret;
     };
     (routeNode["renderFunc"] as TreeNode)[PATCHED_FLAG] = true;
@@ -136,12 +149,96 @@ function patchLibraryRoute(tree: unknown): unknown {
       params?.["appid"] ??
       matchParams?.["appid"];
     const appId = parseInt(String(raw), 10);
-    if (!isNaN(appId) && appId > 0) fire(appId, "deep-search");
+    if (!isNaN(appId) && appId > 0) fire(appId, "deep-search", true);
   } else {
     console.warn("[QuickLaunch] patchLibraryRoute fired but no appId found in tree.");
   }
 
   return tree;
+}
+
+// ------------------------------------------------------------------ //
+// Strategy 0 – patch Router.history.push / replace (pre-commit)      //
+// ------------------------------------------------------------------ //
+
+/**
+ * Monkey-patches Router.history.push (and .replace) so we intercept
+ * game-page navigations *before* the location commits.
+ *
+ * When a game route is detected:
+ *   • fire() is called with navigate=false (no NavigateBack needed – we
+ *     swallow the push entirely so the user never leaves the current page).
+ *   • If the bypass succeeds (game is launchable) the push is dropped.
+ *   • If the bypass is aborted (game not installed) the original push
+ *     is forwarded so the detail page opens normally.
+ *
+ * Returns a cleanup function that restores the originals, or null if
+ * the history object is unavailable.
+ */
+function tryPatchHistoryPush(): (() => void) | null {
+  try {
+    const history = (Router as unknown as Record<string, unknown>)?.["history"] as
+      | (Record<string, unknown> & { push: (...a: unknown[]) => void; replace?: (...a: unknown[]) => void })
+      | undefined;
+
+    if (!history || typeof history["push"] !== "function") {
+      console.warn("[QuickLaunch] Router.history.push not available for patching.");
+      return null;
+    }
+
+    const originalPush    = history["push"].bind(history);
+    const originalReplace = typeof history["replace"] === "function"
+      ? (history["replace"] as (...a: unknown[]) => void).bind(history)
+      : null;
+
+    function intercept(
+      original: (...a: unknown[]) => void,
+      location: unknown,
+      state?: unknown,
+    ): void {
+      const pathname =
+        typeof location === "string"
+          ? location
+          : (location as Record<string, unknown> | null)?.["pathname"] as string | undefined;
+
+      if (pathname) {
+        const m = pathname.match(GAME_ROUTE_RE);
+        if (m) {
+          const appId = parseInt(m[1], 10);
+          if (appId > 0) {
+            // navigate=false: we are about to block the push, so the
+            // overview page will never be entered and NavigateBack is wrong.
+            const bypassed = fire(appId, "history-push", false);
+            if (bypassed) {
+              // Push swallowed – user stays on current page, game launches.
+              return;
+            }
+            // Bypass aborted (e.g. not installed) – let the push through.
+          }
+        }
+      }
+      original(location, state);
+    }
+
+    history["push"] = (location: unknown, state?: unknown) =>
+      intercept(originalPush, location, state);
+
+    if (originalReplace) {
+      history["replace"] = (location: unknown, state?: unknown) =>
+        intercept(originalReplace, location, state);
+    }
+
+    console.log("[QuickLaunch] Router.history.push/replace patched (Strategy 0).");
+
+    return () => {
+      history["push"] = originalPush;
+      if (originalReplace) history["replace"] = originalReplace;
+      console.log("[QuickLaunch] Router.history.push/replace restored.");
+    };
+  } catch (err) {
+    console.warn("[QuickLaunch] tryPatchHistoryPush error:", err);
+    return null;
+  }
 }
 
 // ------------------------------------------------------------------ //
@@ -175,7 +272,8 @@ function tryRegisterHistoryListener(): (() => void) | null {
         if (!m) return;
 
         const appId = parseInt(m[1], 10);
-        if (appId > 0) fire(appId, "history-listen");
+        // history.listen fires after the push commits → NavigateBack needed.
+        if (appId > 0) fire(appId, "history-listen", true);
       }
     );
 
@@ -199,13 +297,24 @@ function tryRegisterHistoryListener(): (() => void) | null {
 export function registerLibraryPatch(): () => void {
   const cleanups: Array<() => void> = [];
 
-  // ── Strategy 1: history listener ─────────────────────────────────
+  // ── Strategy 0: patch history.push/replace (pre-commit, best) ────
+  // Intercepts navigation before the location commits, so the overview
+  // page is never entered and NavigateBack is not needed.
+  const unpatchPush = tryPatchHistoryPush();
+  if (unpatchPush) {
+    cleanups.push(unpatchPush);
+  }
+
+  // ── Strategy 1: history.listen (post-commit fallback) ────────────
+  // Fires after the location has changed; NavigateBack is required.
+  // Registered even when Strategy 0 succeeded – the per-appId debounce
+  // prevents double-firing since a blocked push never changes the location.
   const unlistenHistory = tryRegisterHistoryListener();
   if (unlistenHistory) {
     cleanups.push(unlistenHistory);
   }
 
-  // ── Strategy 2: routerHook route patch ───────────────────────────
+  // ── Strategy 2: routerHook route patch (render-time fallback) ────
   try {
     const patch = routerHook.addPatch(LIBRARY_APP_ROUTE, patchLibraryRoute);
     cleanups.push(() => routerHook.removePatch(LIBRARY_APP_ROUTE, patch));
