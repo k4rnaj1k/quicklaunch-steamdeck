@@ -15,7 +15,7 @@ import {
   staticClasses,
 } from "@decky/ui";
 import { callable, toaster } from "@decky/api";
-import { useEffect, useState, VFC } from "react";
+import React, { useEffect, useState, VFC } from "react";
 import { FaRocket } from "react-icons/fa";
 
 import { registerLibraryPatch } from "./hooks/libraryPatch";

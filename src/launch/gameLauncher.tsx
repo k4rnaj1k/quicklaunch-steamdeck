@@ -22,7 +22,9 @@
  *   LAUNCH_TYPE_SHORTCUT(104)  – non-Steam shortcut (appId >= 0x80000000)
  */
 
-import { Navigation, toaster } from "@decky/api";
+import React from "react";
+import { toaster } from "@decky/api";
+import { Navigation } from "@decky/ui";
 import { FaRocket } from "react-icons/fa";
 import { getAppLaunchState } from "./appStateChecker";
 import {
@@ -31,7 +33,6 @@ import {
   isNonSteamShortcut,
   launchTypeFor,
 } from "../utils/launchUtils";
-import "../types/steamClient.d";
 
 // ------------------------------------------------------------------ //
 // Constants                                                            //

@@ -44,8 +44,6 @@
  * While the tracker is active, isAppRunning(appId) is O(1).
  */
 
-import "../types/steamClient.d";
-
 // ------------------------------------------------------------------ //
 // App launch state enum                                                //
 // ------------------------------------------------------------------ //
@@ -155,7 +153,7 @@ function readUpdateRequired(appId: number): boolean {
 
     const overview = store.GetAppOverviewByAppID(appId);
     const clientData = overview?.per_client_data?.[0];
-    return clientData?.client_has_available_update === true;
+    return (clientData as Record<string, unknown>)?.["client_has_available_update"] === true;
   } catch {
     return false;
   }
