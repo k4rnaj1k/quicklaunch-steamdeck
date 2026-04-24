@@ -1,27 +1,18 @@
 /**
  * libraryPatch.ts
  *
- * Detects when the Steam UI navigates to a game's detail page.
- *
- * Steam Deck's game mode uses React Router with MemoryHistory — window.location
- * never changes and history.pushState is never called.  The ONLY reliable
- * detection method is routerHook.addPatch from decky-frontend-lib, which
- * directly patches Steam's Router component and fires on every route render.
- *
- * AppId extraction uses three approaches in priority order:
- *   1. afterPatch on renderFunc args (most precise, proven technique)
- *   2. extractAppId on the tree root (handles React Router v6 shape)
- *   3. findInReactTree deep search for any appid-bearing node
+ * Detects when the Steam UI navigates to a game's detail page using
+ * routerHook.addPatch from @decky/api and extracts the appId from the
+ * React element tree via three fallback approaches.
  */
 
-import { routerHook, findInReactTree, afterPatch } from "decky-frontend-lib";
+import { routerHook } from "@decky/api";
 import { notifyGameSelected } from "../state/pluginState";
 import { extractAppId } from "../utils/routeUtils";
 
 const LIBRARY_APP_ROUTE = "/library/app/:appid";
 const PATCHED_FLAG = "__qlPatched";
 
-// Debounce so rapid re-renders don't fire multiple bypasses.
 let _lastFiredAt = 0;
 const DEBOUNCE_MS = 600;
 
@@ -34,64 +25,85 @@ function fire(appId: number, source: string): void {
 }
 
 // ------------------------------------------------------------------ //
+// Simple recursive React-tree search (replaces findInReactTree)       //
+// ------------------------------------------------------------------ //
+
+type TreeNode = Record<string, unknown>;
+
+function findInTree(
+  tree: unknown,
+  predicate: (n: TreeNode) => boolean,
+  depth = 0,
+): TreeNode | null {
+  if (depth > 25 || tree === null || tree === undefined) return null;
+  if (typeof tree !== "object") return null;
+  if (Array.isArray(tree)) {
+    for (const item of tree) {
+      const found = findInTree(item, predicate, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  const obj = tree as TreeNode;
+  if (predicate(obj)) return obj;
+  for (const key of Object.keys(obj)) {
+    const val = obj[key];
+    if (val && typeof val === "object") {
+      const found = findInTree(val, predicate, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+// ------------------------------------------------------------------ //
 // Route patch callback                                                 //
 // ------------------------------------------------------------------ //
 
 function patchLibraryRoute(tree: unknown): unknown {
-  // ── Approach 1: extract from tree root (React Router v5/v6 props) ──
+  // ── Approach 1: extractAppId on tree root (React Router v5/v6) ────
   const appIdFromRoot = extractAppId([tree]);
   if (appIdFromRoot && appIdFromRoot > 0) {
     fire(appIdFromRoot, "tree-root");
     return tree;
   }
 
-  // ── Approach 2: find renderFunc and afterPatch its args ────────────
-  const routeProps = findInReactTree(
-    tree,
-    (node: unknown) =>
-      node !== null &&
-      typeof node === "object" &&
-      typeof (node as Record<string, unknown>)["renderFunc"] === "function",
-  ) as Record<string, unknown> | null;
-
-  if (routeProps) {
-    if (!(routeProps["renderFunc"] as Record<string, unknown>)[PATCHED_FLAG]) {
-      afterPatch(
-        routeProps,
-        "renderFunc",
-        (args: unknown[], ret: unknown): unknown => {
-          const appId = extractAppId(args as unknown[]);
-          if (appId && appId > 0) fire(appId, "renderFunc-args");
-          return ret;
-        },
-      );
-      (routeProps["renderFunc"] as Record<string, unknown>)[PATCHED_FLAG] = true;
-      console.log("[QuickLaunch] renderFunc wrapped via afterPatch.");
-    }
+  // ── Approach 2: find renderFunc node and wrap it ──────────────────
+  const routeNode = findInTree(tree, (n) => typeof n["renderFunc"] === "function");
+  if (routeNode && !(routeNode["renderFunc"] as TreeNode)[PATCHED_FLAG]) {
+    const original = routeNode["renderFunc"] as (...args: unknown[]) => unknown;
+    routeNode["renderFunc"] = function (...args: unknown[]) {
+      const ret = original.apply(this as unknown, args);
+      const appId = extractAppId(args);
+      if (appId && appId > 0) fire(appId, "renderFunc-args");
+      return ret;
+    };
+    (routeNode["renderFunc"] as TreeNode)[PATCHED_FLAG] = true;
     return tree;
   }
 
-  // ── Approach 3: deep-search tree for any node with appid ──────────
-  const nodeWithAppId = findInReactTree(
-    tree,
-    (node: unknown) => {
-      if (!node || typeof node !== "object") return false;
-      const n = node as Record<string, unknown>;
-      const raw = n["appid"] ?? n["appId"] ??
-        (n["params"] as Record<string, unknown> | undefined)?.["appid"] ??
-        (n["match"] as Record<string, unknown> | undefined)
-          ?.["params"]?.["appid"];
-      return raw !== undefined && raw !== null;
-    },
-  ) as Record<string, unknown> | null;
+  // ── Approach 3: deep-search for any node carrying appid ───────────
+  const nodeWithId = findInTree(tree, (n) => {
+    const params = n["params"] as TreeNode | undefined;
+    const match  = n["match"]  as TreeNode | undefined;
+    const matchParams = match?.["params"] as TreeNode | undefined;
+    return (
+      n["appid"] !== undefined ||
+      n["appId"] !== undefined ||
+      params?.["appid"] !== undefined ||
+      matchParams?.["appid"] !== undefined
+    );
+  });
 
-  if (nodeWithAppId) {
+  if (nodeWithId) {
+    const params      = nodeWithId["params"]  as TreeNode | undefined;
+    const match       = nodeWithId["match"]   as TreeNode | undefined;
+    const matchParams = match?.["params"]     as TreeNode | undefined;
     const raw =
-      nodeWithAppId["appid"] ??
-      nodeWithAppId["appId"] ??
-      (nodeWithAppId["params"] as Record<string, unknown>)?.["appid"] ??
-      (nodeWithAppId["match"] as Record<string, unknown>)
-        ?.["params"]?.["appid"];
+      nodeWithId["appid"] ??
+      nodeWithId["appId"] ??
+      params?.["appid"] ??
+      matchParams?.["appid"];
     const appId = parseInt(String(raw), 10);
     if (!isNaN(appId) && appId > 0) fire(appId, "deep-search");
   } else {

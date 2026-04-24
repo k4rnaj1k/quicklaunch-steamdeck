@@ -24,7 +24,7 @@
 
 import React from "react";
 import { toaster } from "@decky/api";
-import { Navigation } from "decky-frontend-lib";
+import { Navigation } from "@decky/ui";
 import { FaRocket } from "react-icons/fa";
 import { getAppLaunchState } from "./appStateChecker";
 import {

@@ -153,7 +153,7 @@ function readUpdateRequired(appId: number): boolean {
 
     const overview = store.GetAppOverviewByAppID(appId);
     const clientData = overview?.per_client_data?.[0];
-    return (clientData as Record<string, unknown>)?.["client_has_available_update"] === true;
+    return (clientData as unknown as Record<string, unknown>)?.["client_has_available_update"] === true;
   } catch {
     return false;
   }
