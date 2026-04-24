@@ -29,6 +29,7 @@ import { routerHook } from "@decky/api";
 import { findInReactTree, afterPatch } from "decky-frontend-lib";
 
 import { notifyGameSelected } from "../state/pluginState";
+import { extractAppId } from "../utils/routeUtils";
 
 // ------------------------------------------------------------------ //
 // Constants                                                            //
@@ -40,35 +41,7 @@ const LIBRARY_APP_ROUTE = "/library/app/:appid";
 /** Symbol used to flag a renderFunc that has already been patched. */
 const PATCHED_FLAG = "__qlLibraryPatched";
 
-// ------------------------------------------------------------------ //
-// Internal helpers                                                     //
-// ------------------------------------------------------------------ //
-
-/**
- * Extract a numeric appId from the arguments that Steam passes to a
- * route's renderFunc.  Steam passes a params/match object as the first
- * argument; the exact shape differs across SteamOS versions.
- */
-function extractAppId(args: unknown[]): number | null {
-  if (!args || args.length === 0) return null;
-
-  const arg = args[0] as Record<string, unknown> | null | undefined;
-  if (!arg) return null;
-
-  // Try several known shapes, most-specific first.
-  const raw =
-    (arg["appid"] as string | number | undefined) ??
-    ((arg["match"] as Record<string, unknown> | undefined)?.["params"] as
-      | Record<string, string>
-      | undefined)?.["appid"] ??
-    ((arg["params"] as Record<string, string> | undefined)?.["appid"]) ??
-    null;
-
-  if (raw === null || raw === undefined) return null;
-
-  const id = typeof raw === "number" ? raw : parseInt(raw as string, 10);
-  return isNaN(id) ? null : id;
-}
+// extractAppId is imported from ../utils/routeUtils (see above).
 
 // ------------------------------------------------------------------ //
 // Route patcher                                                        //

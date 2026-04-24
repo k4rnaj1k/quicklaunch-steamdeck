@@ -25,17 +25,17 @@
 import { Navigation, toaster } from "@decky/api";
 import { FaRocket } from "react-icons/fa";
 import { getAppLaunchState } from "./appStateChecker";
+import {
+  LAUNCH_TYPE_GAME,
+  LAUNCH_TYPE_SHORTCUT,
+  isNonSteamShortcut,
+  launchTypeFor,
+} from "../utils/launchUtils";
 import "../types/steamClient.d";
 
 // ------------------------------------------------------------------ //
 // Constants                                                            //
 // ------------------------------------------------------------------ //
-
-/** Steam appId threshold above which an id is a non-Steam shortcut. */
-const NON_STEAM_APPID_THRESHOLD = 0x80000000; // 2 147 483 648
-
-const LAUNCH_TYPE_GAME = 100;
-const LAUNCH_TYPE_SHORTCUT = 104;
 
 /**
  * Milliseconds to wait after issuing RunGame before navigating back.
@@ -50,16 +50,8 @@ const DEBOUNCE_MS = 500;
 // Helpers                                                              //
 // ------------------------------------------------------------------ //
 
-function isNonSteamShortcut(appId: number): boolean {
-  return appId >= NON_STEAM_APPID_THRESHOLD;
-}
-
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function launchTypeFor(appId: number): number {
-  return isNonSteamShortcut(appId) ? LAUNCH_TYPE_SHORTCUT : LAUNCH_TYPE_GAME;
 }
 
 // ------------------------------------------------------------------ //
