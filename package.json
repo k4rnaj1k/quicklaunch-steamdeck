@@ -2,6 +2,8 @@
   "name": "quicklaunch",
   "version": "1.0.0",
   "description": "A Decky Loader plugin to instantly launch games without the game detail/preview page.",
+  "author": "vladliasota",
+  "license": "MIT",
   "scripts": {
     "build": "shx rm -rf dist && rollup -c",
     "watch": "rollup -c -w",

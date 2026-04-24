@@ -1,10 +1,10 @@
 {
   "name": "QuickLaunch",
-  "author": "vladliasota@gmail.com",
+  "author": "vladliasota",
   "flags": [],
   "publish": {
-    "description": "Launch games instantly from the Steam Deck library without navigating through the game detail/preview page.",
-    "tags": ["utility", "games", "library"],
-    "image": "https://i.imgur.com/placeholder.png"
+    "description": "Launch games instantly from the Steam Deck library without navigating through the game detail/preview page. Supports native Linux games, Proton titles, and non-Steam shortcuts.",
+    "tags": ["utility", "games", "library", "qol"],
+    "image": "https://raw.githubusercontent.com/vladliasota/steam-decky-quicklaunch-plugin/main/assets/store-image.png"
   }
 }

@@ -1,0 +1,14 @@
+Place the Decky store image here as `store-image.png`.
+
+Decky Plugin Store requirements for the store image:
+  - Filename : store-image.png
+  - Dimensions: 460 × 215 px  (Steam capsule format)
+  - Format    : PNG
+  - Max size  : 1 MB
+  - Content   : Plugin name / logo on a clear background
+
+The plugin.json "image" field points to:
+  https://raw.githubusercontent.com/vladliasota/steam-decky-quicklaunch-plugin/main/assets/store-image.png
+
+This file must be committed to the repository before submitting a PR
+to the decky-plugin-database store.
