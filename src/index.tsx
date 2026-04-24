@@ -8,14 +8,14 @@
  */
 
 import {
-  ButtonItem,
   definePlugin,
   PanelSection,
   PanelSectionRow,
+  ToggleField,
   staticClasses,
 } from "@decky/ui";
 import { callable, toaster } from "@decky/api";
-import { VFC } from "react";
+import { useEffect, useState, VFC } from "react";
 import { FaRocket } from "react-icons/fa";
 
 import { registerLibraryPatch } from "./hooks/libraryPatch";
@@ -25,6 +25,7 @@ import {
   isEnabled,
   setEnabled,
   setGameSelectedListener,
+  subscribeToEnabled,
 } from "./state/pluginState";
 
 // ---------------------------------------------------------------------- //
@@ -41,24 +42,37 @@ const saveSettings = callable<[{ enabled: boolean }], boolean>("save_settings");
 // Quick Access Menu (QAM) content component                               //
 // ---------------------------------------------------------------------- //
 
-const QuickLaunchQAM: VFC<{ onToggle: () => void }> = ({ onToggle }) => {
-  // Read from module state directly so QAM always reflects the live value.
-  const enabled = isEnabled();
+/**
+ * QuickLaunchQAM
+ *
+ * Renders a single ToggleField that shows and controls whether quick-launch
+ * is active.  Local React state (`enabled`) is initialised from the module
+ * state and stays in sync via `subscribeToEnabled`, so async events such as
+ * the initial settings load from the Python backend are reflected
+ * automatically without any prop-drilling or context provider.
+ */
+const QuickLaunchQAM: VFC<{
+  onToggle: (next: boolean) => Promise<void>;
+}> = ({ onToggle }) => {
+  const [enabled, setLocalEnabled] = useState<boolean>(isEnabled());
+
+  // Keep local React state in sync with the module state.
+  // subscribeToEnabled returns an unsubscribe function used as cleanup.
+  useEffect(() => subscribeToEnabled(setLocalEnabled), []);
 
   return (
     <PanelSection title="QuickLaunch">
       <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          onClick={onToggle}
+        <ToggleField
+          label="Quick Launch"
           description={
             enabled
               ? "Selecting a game launches it immediately."
               : "Normal Steam behaviour restored."
           }
-        >
-          {enabled ? "Enabled – click to disable" : "Disabled – click to enable"}
-        </ButtonItem>
+          checked={enabled}
+          onChange={onToggle}
+        />
       </PanelSectionRow>
     </PanelSection>
   );
@@ -74,6 +88,9 @@ export default definePlugin(() => {
 
   // ---------------------------------------------------------------- //
   // Load persisted settings on startup                                //
+  // Calling setEnabled() here propagates to all subscribeToEnabled    //
+  // listeners, so the QAM ToggleField re-renders automatically once   //
+  // the async call resolves.                                           //
   // ---------------------------------------------------------------- //
   (async () => {
     try {
@@ -94,9 +111,6 @@ export default definePlugin(() => {
    *
    * Immediately launches the game and navigates back to the library,
    * effectively bypassing the game detail / preview page entirely.
-   *
-   * Edge-case handling (Play / Continue prompts, uninstalled games, etc.)
-   * will be layered on top of this in the next task.
    */
   function onGameSelected(appId: number): void {
     if (!isEnabled()) {
@@ -106,32 +120,43 @@ export default definePlugin(() => {
       return;
     }
 
-    // Fire-and-forget: bypassAndLaunch is async (needs a tiny sleep before
-    // navigating) but we intentionally don't await it here so the patch
-    // callback returns immediately and doesn't block Steam's render pipeline.
+    // Fire-and-forget: bypassAndLaunch is async but must not block the
+    // route patch callback, which runs in Steam's render pipeline.
     bypassAndLaunch(appId).catch((err) => {
       console.error(`[QuickLaunch] bypassAndLaunch failed for appId=${appId}:`, err);
     });
   }
 
   // ---------------------------------------------------------------- //
-  // Toggle handler                                                     //
+  // Toggle handler (called by the ToggleField's onChange)             //
   // ---------------------------------------------------------------- //
 
-  const handleToggle = async (): Promise<void> => {
-    const next = !isEnabled();
+  /**
+   * Persists the new value to the Python backend, updates module state
+   * (which notifies all subscribeToEnabled listeners including the QAM
+   * component), and shows a brief confirmation toast.
+   *
+   * @param next  The new toggle value emitted by ToggleField.onChange.
+   */
+  const handleToggle = async (next: boolean): Promise<void> => {
+    // Update module state immediately (optimistic) so the bypass logic
+    // reflects the new value without waiting for the backend round-trip.
     setEnabled(next);
 
     try {
       await saveSettings({ enabled: next });
-      toaster.toast({
-        title: "QuickLaunch",
-        body: next ? "Quick-launch enabled." : "Quick-launch disabled.",
-        icon: <FaRocket />,
-      });
     } catch (err) {
       console.error("[QuickLaunch] Failed to save settings:", err);
+      // On error: roll back module state and re-notify subscribers.
+      setEnabled(!next);
     }
+
+    toaster.toast({
+      title: "QuickLaunch",
+      body: next ? "Quick-launch enabled." : "Quick-launch disabled.",
+      icon: <FaRocket />,
+      duration: 2000,
+    });
   };
 
   // ---------------------------------------------------------------- //
@@ -173,7 +198,7 @@ export default definePlugin(() => {
       // during teardown.
       setGameSelectedListener(null);
 
-      // Run all registered cleanup functions (route patches, etc.).
+      // Run all registered cleanup functions (route patches, trackers, etc.).
       for (const cleanup of cleanupHooks) {
         try {
           cleanup();
