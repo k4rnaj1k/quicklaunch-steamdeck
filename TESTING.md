@@ -6,6 +6,72 @@ a real Steam Deck before each release.
 
 ---
 
+## 0. Installing the Plugin for Testing
+
+Before running any manual tests you need to get the plugin onto your Steam Deck.
+Choose whichever method fits your workflow.
+
+### Option A – Install a pre-built zip (quickest)
+
+1. Download `QuickLaunch.zip` from the
+   [latest GitHub Release](https://github.com/vladliasota/steam-decky-quicklaunch-plugin/releases/latest).
+2. Extract the zip — you should see a `QuickLaunch/` folder.
+3. Copy it to the Steam Deck's plugin directory.  
+   **Via SSH / SCP (recommended):**
+   ```bash
+   scp -r QuickLaunch/ deck@steamdeck.local:~/homebrew/plugins/
+   ```
+   **Via USB in Desktop Mode:**  
+   Copy the `QuickLaunch/` folder to `/home/deck/homebrew/plugins/` using
+   Dolphin or any file manager.
+4. Restart Decky Loader:
+   - Open the Quick Access Menu (`···`) → Decky tab → ⚙ Settings → **Restart**.
+5. The **QuickLaunch** panel (rocket icon) should appear in the Quick Access Menu.
+
+---
+
+### Option B – Build from source and deploy (for developers)
+
+```bash
+# 1. Clone the repo (or use your fork)
+git clone https://github.com/vladliasota/steam-decky-quicklaunch-plugin.git
+cd steam-decky-quicklaunch-plugin
+
+# 2. Install Node dependencies
+npm install
+
+# 3. Build the frontend bundle
+npm run build
+# → produces dist/index.js
+
+# 4. Deploy to the Steam Deck via rsync (adjust hostname / IP as needed)
+rsync -av --delete \
+  dist/ plugin.json main.py LICENSE \
+  deck@steamdeck.local:~/homebrew/plugins/QuickLaunch/
+
+# 5. Reload Decky on the device (SSH)
+ssh deck@steamdeck.local \
+  "systemctl --user restart plugin_loader.service 2>/dev/null || true"
+```
+
+> **Tip:** The Steam Deck's default SSH password is `deck` unless you changed
+> it.  Enable SSH in Desktop Mode → System Settings → SSH, or via the Decky
+> Developer mode toggle.
+
+---
+
+### Verify installation
+
+After restarting Decky:
+
+1. Press the **Quick Access Menu** button (`···`).
+2. You should see a **rocket icon** entry labelled **QuickLaunch**.
+3. Open it — the **Quick Launch** toggle should be **on** by default.
+4. Select any installed game in your library.  
+   It should start launching immediately **without** the detail page appearing.
+
+---
+
 ## 1. Automated Unit Tests
 
 ```bash
