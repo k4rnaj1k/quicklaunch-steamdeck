@@ -1,5 +1,5 @@
 /**
- * gameLauncher.ts
+ * gameLauncher.tsx
  *
  * Handles the core "bypass" behaviour: when a game is selected in the
  * Steam Deck library, check its launch state, then immediately launch it
