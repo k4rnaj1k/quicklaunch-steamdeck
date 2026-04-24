@@ -2,6 +2,7 @@
 module.exports = {
   preset: "ts-jest",
   testEnvironment: "node",
+  setupFiles: ["<rootDir>/src/tests/setup.ts"],
   // Only run files under src/tests/ to avoid accidentally picking up
   // source files that import browser-only Decky / Steam CEF globals.
   testMatch: ["**/src/tests/**/*.test.ts"],
