@@ -10,7 +10,7 @@ export default {
   plugins: [
     commonjs(),
     nodeResolve(),
-    typescript(),
+    typescript({ tsconfig: "./tsconfig.build.json" }),
     replace({
       preventAssignment: false,
       "process.env.NODE_ENV": JSON.stringify("production"),
