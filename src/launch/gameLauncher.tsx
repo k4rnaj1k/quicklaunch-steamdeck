@@ -183,13 +183,17 @@ export async function bypassAndLaunch(appId: number): Promise<void> {
       break;
   }
 
+  // ── Navigate away first, THEN launch ────────────────────────────
+  // Calling NavigateBack() before RunGame dismisses the detail page
+  // immediately; the game launches in the background regardless.
+  navigateToLibrary();
+
+  // Brief pause so the navigation commits before RunGame fires.
+  await sleep(NAV_DELAY_MS);
+
   // ── Issue the launch command ──────────────────────────────────────
   const apiOk = tryRunGameAPI(appId);
   if (!apiOk) {
     tryUrlSchemeFallback(appId);
   }
-
-  // ── Brief pause, then navigate away from the detail page ─────────
-  await sleep(NAV_DELAY_MS);
-  navigateToLibrary();
 }
