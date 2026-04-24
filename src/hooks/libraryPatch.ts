@@ -1,40 +1,104 @@
 /**
  * libraryPatch.ts
  *
- * Detects when the Steam UI navigates to a game's detail page by patching
- * window.history.pushState — the underlying browser API that React Router
- * calls for every client-side navigation.  This is version-agnostic: it
- * works regardless of the SteamOS React Router version or the exact route
- * path string used internally.
+ * Detects when the Steam UI navigates to a game's detail page.
  *
- * We also keep a routerHook.addPatch as a secondary signal in case Steam
- * routes the navigation differently on some firmware versions.
+ * Steam Deck's game mode uses React Router with MemoryHistory — window.location
+ * never changes and history.pushState is never called.  The ONLY reliable
+ * detection method is routerHook.addPatch from decky-frontend-lib, which
+ * directly patches Steam's Router component and fires on every route render.
  *
- * Detection: /library/app/<appid> in the pushed URL
- * Navigation back: window.history.back() — always reliable
+ * AppId extraction uses three approaches in priority order:
+ *   1. afterPatch on renderFunc args (most precise, proven technique)
+ *   2. extractAppId on the tree root (handles React Router v6 shape)
+ *   3. findInReactTree deep search for any appid-bearing node
  */
 
-import { routerHook } from "@decky/api";
+import { routerHook, findInReactTree, afterPatch } from "decky-frontend-lib";
 import { notifyGameSelected } from "../state/pluginState";
+import { extractAppId } from "../utils/routeUtils";
 
 const LIBRARY_APP_ROUTE = "/library/app/:appid";
-const APP_PATH_RE = /\/library\/app\/(\d+)/;
+const PATCHED_FLAG = "__qlPatched";
 
-// ------------------------------------------------------------------ //
-// Helpers                                                              //
-// ------------------------------------------------------------------ //
+// Debounce so rapid re-renders don't fire multiple bypasses.
+let _lastFiredAt = 0;
+const DEBOUNCE_MS = 600;
 
-function tryExtractAndFire(url: string | URL | null | undefined): void {
-  if (!url) return;
-  const str = typeof url === "string" ? url : url.toString();
-  const match = str.match(APP_PATH_RE);
-  if (!match) return;
-
-  const appId = parseInt(match[1], 10);
-  if (isNaN(appId) || appId <= 0) return;
-
-  console.log(`[QuickLaunch] detected navigation to appId=${appId}`);
+function fire(appId: number, source: string): void {
+  const now = Date.now();
+  if (now - _lastFiredAt < DEBOUNCE_MS) return;
+  _lastFiredAt = now;
+  console.log(`[QuickLaunch] bypass triggered appId=${appId} via ${source}`);
   setTimeout(() => notifyGameSelected(appId), 0);
+}
+
+// ------------------------------------------------------------------ //
+// Route patch callback                                                 //
+// ------------------------------------------------------------------ //
+
+function patchLibraryRoute(tree: unknown): unknown {
+  // ── Approach 1: extract from tree root (React Router v5/v6 props) ──
+  const appIdFromRoot = extractAppId([tree]);
+  if (appIdFromRoot && appIdFromRoot > 0) {
+    fire(appIdFromRoot, "tree-root");
+    return tree;
+  }
+
+  // ── Approach 2: find renderFunc and afterPatch its args ────────────
+  const routeProps = findInReactTree(
+    tree,
+    (node: unknown) =>
+      node !== null &&
+      typeof node === "object" &&
+      typeof (node as Record<string, unknown>)["renderFunc"] === "function",
+  ) as Record<string, unknown> | null;
+
+  if (routeProps) {
+    if (!(routeProps["renderFunc"] as Record<string, unknown>)[PATCHED_FLAG]) {
+      afterPatch(
+        routeProps,
+        "renderFunc",
+        (args: unknown[], ret: unknown): unknown => {
+          const appId = extractAppId(args as unknown[]);
+          if (appId && appId > 0) fire(appId, "renderFunc-args");
+          return ret;
+        },
+      );
+      (routeProps["renderFunc"] as Record<string, unknown>)[PATCHED_FLAG] = true;
+      console.log("[QuickLaunch] renderFunc wrapped via afterPatch.");
+    }
+    return tree;
+  }
+
+  // ── Approach 3: deep-search tree for any node with appid ──────────
+  const nodeWithAppId = findInReactTree(
+    tree,
+    (node: unknown) => {
+      if (!node || typeof node !== "object") return false;
+      const n = node as Record<string, unknown>;
+      const raw = n["appid"] ?? n["appId"] ??
+        (n["params"] as Record<string, unknown> | undefined)?.["appid"] ??
+        (n["match"] as Record<string, unknown> | undefined)
+          ?.["params"]?.["appid"];
+      return raw !== undefined && raw !== null;
+    },
+  ) as Record<string, unknown> | null;
+
+  if (nodeWithAppId) {
+    const raw =
+      nodeWithAppId["appid"] ??
+      nodeWithAppId["appId"] ??
+      (nodeWithAppId["params"] as Record<string, unknown>)?.["appid"] ??
+      (nodeWithAppId["match"] as Record<string, unknown>)
+        ?.["params"]?.["appid"];
+    const appId = parseInt(String(raw), 10);
+    if (!isNaN(appId) && appId > 0) fire(appId, "deep-search");
+  } else {
+    console.warn("[QuickLaunch] patchLibraryRoute fired but no appId found in tree.");
+  }
+
+  return tree;
 }
 
 // ------------------------------------------------------------------ //
@@ -42,39 +106,11 @@ function tryExtractAndFire(url: string | URL | null | undefined): void {
 // ------------------------------------------------------------------ //
 
 export function registerLibraryPatch(): () => void {
-  // ── Primary: intercept pushState ────────────────────────────────────
-  // React Router calls history.pushState for every SPA navigation.
-  // Patching here catches the navigation before any route component renders.
-  const originalPushState = window.history.pushState.bind(window.history);
+  const patch = routerHook.addPatch(LIBRARY_APP_ROUTE, patchLibraryRoute);
+  console.log(`[QuickLaunch] Route patch registered on "${LIBRARY_APP_ROUTE}".`);
 
-  window.history.pushState = function (
-    state: unknown,
-    title: string,
-    url?: string | URL | null,
-  ) {
-    const result = originalPushState(state, title, url);
-    tryExtractAndFire(url);
-    return result;
-  };
-
-  // ── Secondary: routerHook.addPatch ───────────────────────────────────
-  // Fires during React render of the matched route — catches cases where
-  // Steam uses replaceState instead of pushState, or for re-renders.
-  const routerPatch = routerHook.addPatch(
-    LIBRARY_APP_ROUTE,
-    (tree: unknown) => {
-      // At render time the URL should already be updated.
-      tryExtractAndFire(window.location.pathname);
-      return tree;
-    },
-  );
-
-  console.log("[QuickLaunch] Library patch registered (pushState + routerHook).");
-
-  // ── Cleanup ──────────────────────────────────────────────────────────
   return () => {
-    window.history.pushState = originalPushState;
-    routerHook.removePatch(LIBRARY_APP_ROUTE, routerPatch);
-    console.log("[QuickLaunch] Library patch removed.");
+    routerHook.removePatch(LIBRARY_APP_ROUTE, patch);
+    console.log("[QuickLaunch] Route patch removed.");
   };
 }

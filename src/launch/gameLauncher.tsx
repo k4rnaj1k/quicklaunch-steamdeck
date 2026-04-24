@@ -24,7 +24,7 @@
 
 import React from "react";
 import { toaster } from "@decky/api";
-import { Navigation } from "@decky/ui";
+import { Navigation } from "decky-frontend-lib";
 import { FaRocket } from "react-icons/fa";
 import { getAppLaunchState } from "./appStateChecker";
 import {
@@ -91,17 +91,9 @@ function tryUrlSchemeFallback(appId: number): void {
 
 function navigateToLibrary(): void {
   try {
-    // NavigateBack is the safest: returns the user to wherever they came from
-    // (always the library grid when opening a game overview).
-    // Fall back to window.history.back() if Navigation is unavailable.
-    if (typeof Navigation?.NavigateBack === "function") {
-      Navigation.NavigateBack();
-    } else {
-      window.history.back();
-    }
+    Navigation.NavigateBack();
   } catch (err) {
-    console.warn("[QuickLaunch] navigation failed, trying history.back():", err);
-    try { window.history.back(); } catch (_) { /* ignore */ }
+    console.warn("[QuickLaunch] NavigateBack failed:", err);
   }
 }
 
