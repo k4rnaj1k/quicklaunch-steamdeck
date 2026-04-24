@@ -19,6 +19,7 @@ import { VFC } from "react";
 import { FaRocket } from "react-icons/fa";
 
 import { registerLibraryPatch } from "./hooks/libraryPatch";
+import { bypassAndLaunch } from "./launch/gameLauncher";
 import {
   isEnabled,
   setEnabled,
@@ -84,30 +85,32 @@ export default definePlugin(() => {
 
   // ---------------------------------------------------------------- //
   // Game-selection handler                                             //
-  // (detection only for now – launch bypass added in next task)       //
   // ---------------------------------------------------------------- //
 
   /**
    * Fired by libraryPatch whenever the Steam router navigates to
    * /library/app/:appid (i.e. the user selects a game in the library).
    *
-   * Currently just logs the detection; the actual launch bypass will be
-   * implemented in the next task and will augment this handler.
+   * Immediately launches the game and navigates back to the library,
+   * effectively bypassing the game detail / preview page entirely.
+   *
+   * Edge-case handling (Play / Continue prompts, uninstalled games, etc.)
+   * will be layered on top of this in the next task.
    */
   function onGameSelected(appId: number): void {
     if (!isEnabled()) {
       console.log(
-        `[QuickLaunch] Game ${appId} selected but plugin is disabled – doing nothing.`
+        `[QuickLaunch] Game ${appId} selected but plugin is disabled – passing through.`
       );
       return;
     }
 
-    console.log(
-      `[QuickLaunch] Detected game selection: appId=${appId}. ` +
-        `(Launch bypass will be wired here in the next task.)`
-    );
-
-    // TODO (next task): invoke game launch and navigate away from detail page.
+    // Fire-and-forget: bypassAndLaunch is async (needs a tiny sleep before
+    // navigating) but we intentionally don't await it here so the patch
+    // callback returns immediately and doesn't block Steam's render pipeline.
+    bypassAndLaunch(appId).catch((err) => {
+      console.error(`[QuickLaunch] bypassAndLaunch failed for appId=${appId}:`, err);
+    });
   }
 
   // ---------------------------------------------------------------- //
