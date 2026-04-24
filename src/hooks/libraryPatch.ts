@@ -2,103 +2,50 @@
  * libraryPatch.ts
  *
  * Registers a Decky routerHook patch on the Steam library game-detail route
- * (/library/app/:appid).  Every time the Steam UI navigates to a game's
- * detail page (i.e. the user selects / highlights a game and presses A),
- * the patch fires, extracts the numeric appId from the React router tree,
- * and calls notifyGameSelected().
+ * (/library/app/:appid).  When Steam navigates to a game's detail page
+ * (user selects a game and presses A), the patch fires, reads the appId
+ * from the current URL, and schedules the bypass via setTimeout so it runs
+ * outside the React render cycle.
  *
- * Detection mechanism
- * -------------------
- * Steam's game-mode UI is a React SPA.  When the user selects a game in
- * the library grid, the router navigates to /library/app/<appid>.
- * routerHook.addPatch lets us intercept that navigation and receive the
- * React element tree for the matched route before it is committed to the
- * DOM.  We use findInReactTree + afterPatch (from decky-frontend-lib) to
- * wrap the route's renderFunc and read the appId out of the route params
- * that Steam passes as the first argument.
- *
- * Lifecycle
- * ---------
- *   registerLibraryPatch()  →  call from plugin onMount
- *   returned cleanup fn     →  call from plugin onDismount
+ * Why URL-based detection instead of findInReactTree/afterPatch:
+ *   The React tree structure varies across SteamOS versions — findInReactTree
+ *   looking for a renderFunc node is fragile and silently no-ops when the
+ *   node shape changes.  Reading window.location.pathname is version-agnostic
+ *   and always reliable when the route has matched.
  */
 
 import { routerHook } from "@decky/api";
-// findInReactTree / afterPatch live in decky-frontend-lib (re-exported by
-// @decky/ui in some Decky versions – fall back to direct import if needed).
-import { findInReactTree, afterPatch } from "decky-frontend-lib";
-
 import { notifyGameSelected } from "../state/pluginState";
-import { extractAppId } from "../utils/routeUtils";
-
-// ------------------------------------------------------------------ //
-// Constants                                                            //
-// ------------------------------------------------------------------ //
 
 /** The Steam router path for a game's detail / preview page. */
 const LIBRARY_APP_ROUTE = "/library/app/:appid";
 
-/** Symbol used to flag a renderFunc that has already been patched. */
-const PATCHED_FLAG = "__qlLibraryPatched";
-
-// extractAppId is imported from ../utils/routeUtils (see above).
+/** Regex to pull the numeric appId out of the current pathname. */
+const APP_PATH_RE = /\/library\/app\/(\d+)/;
 
 // ------------------------------------------------------------------ //
 // Route patcher                                                        //
 // ------------------------------------------------------------------ //
 
-/**
- * Called by Decky's routerHook for every render cycle on the
- * /library/app/:appid route.  Wraps the route's renderFunc once (guarded
- * by PATCHED_FLAG) so we don't double-wrap on re-renders.
- */
 function patchLibraryRoute(tree: unknown): unknown {
-  // Find the node that owns the renderFunc – this is the route element
-  // returned by Steam's router that actually renders the game detail page.
-  const routeProps = findInReactTree(
-    tree,
-    (node: unknown) =>
-      node !== null &&
-      typeof node === "object" &&
-      typeof (node as Record<string, unknown>)["renderFunc"] === "function"
-  ) as Record<string, unknown> | null;
-
-  if (!routeProps) {
-    console.warn("[QuickLaunch] libraryPatch: could not find renderFunc in route tree.");
+  const match = window.location.pathname.match(APP_PATH_RE);
+  if (!match) {
+    console.warn("[QuickLaunch] libraryPatch: route fired but pathname did not match.", window.location.pathname);
     return tree;
   }
 
-  // Guard: only wrap once per renderFunc instance.
-  if ((routeProps["renderFunc"] as Record<string, unknown>)[PATCHED_FLAG]) {
+  const appId = parseInt(match[1], 10);
+  if (isNaN(appId) || appId <= 0) {
+    console.warn("[QuickLaunch] libraryPatch: parsed appId is invalid:", match[1]);
     return tree;
   }
 
-  afterPatch(
-    routeProps,
-    "renderFunc",
-    (args: unknown[], ret: unknown): unknown => {
-      const appId = extractAppId(args as unknown[]);
+  console.log(`[QuickLaunch] libraryPatch: detected appId=${appId}, scheduling bypass.`);
 
-      if (appId !== null) {
-        notifyGameSelected(appId);
-      } else {
-        console.warn(
-          "[QuickLaunch] libraryPatch: renderFunc fired but appId could not be extracted.",
-          args
-        );
-      }
+  // Defer outside the render cycle so React doesn't see a navigation
+  // triggered synchronously during a route render.
+  setTimeout(() => notifyGameSelected(appId), 0);
 
-      // Always return the original React element unchanged – detection only.
-      // The *bypass* (navigating away / launching the game) is handled in
-      // the next task and will augment this same patch point.
-      return ret;
-    }
-  );
-
-  // Mark so we don't re-wrap on subsequent route renders.
-  (routeProps["renderFunc"] as Record<string, unknown>)[PATCHED_FLAG] = true;
-
-  console.log("[QuickLaunch] libraryPatch: renderFunc wrapped successfully.");
   return tree;
 }
 
@@ -106,23 +53,9 @@ function patchLibraryRoute(tree: unknown): unknown {
 // Public API                                                           //
 // ------------------------------------------------------------------ //
 
-/**
- * Register the library route patch with Decky's routerHook.
- *
- * @returns A cleanup function that removes the patch – call it from
- *          the plugin's onDismount to prevent memory leaks.
- *
- * @example
- *   // In definePlugin → onMount:
- *   const removeLibraryPatch = registerLibraryPatch();
- *   cleanupHooks.push(removeLibraryPatch);
- */
 export function registerLibraryPatch(): () => void {
   const patch = routerHook.addPatch(LIBRARY_APP_ROUTE, patchLibraryRoute);
-
-  console.log(
-    `[QuickLaunch] Registered library route patch on "${LIBRARY_APP_ROUTE}".`
-  );
+  console.log(`[QuickLaunch] Registered library route patch on "${LIBRARY_APP_ROUTE}".`);
 
   return () => {
     routerHook.removePatch(LIBRARY_APP_ROUTE, patch);
