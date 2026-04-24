@@ -20,6 +20,7 @@ import { FaRocket } from "react-icons/fa";
 
 import { registerLibraryPatch } from "./hooks/libraryPatch";
 import { bypassAndLaunch } from "./launch/gameLauncher";
+import { startRunningAppsTracker } from "./launch/appStateChecker";
 import {
   isEnabled,
   setEnabled,
@@ -149,16 +150,21 @@ export default definePlugin(() => {
     content: <QuickLaunchQAM onToggle={handleToggle} />,
 
     onMount(): void {
-      // 1. Register the library route patch – this is what detects game
-      //    selection by intercepting /library/app/:appid navigation.
+      // 1. Start tracking which games are currently running so
+      //    appStateChecker can answer isAppRunning() in O(1).
+      const stopTracker = startRunningAppsTracker();
+      cleanupHooks.push(stopTracker);
+
+      // 2. Register the library route patch – intercepts /library/app/:appid
+      //    navigation to detect game selection and trigger the bypass.
       const removeLibraryPatch = registerLibraryPatch();
       cleanupHooks.push(removeLibraryPatch);
 
-      // 2. Wire our handler into the shared state so the patch can call it.
+      // 3. Wire our handler into the shared state so the patch can call it.
       setGameSelectedListener(onGameSelected);
 
       console.log(
-        "[QuickLaunch] Plugin mounted – library route patch active."
+        "[QuickLaunch] Plugin mounted – route patch and running-apps tracker active."
       );
     },
 

@@ -2,37 +2,29 @@
  * gameLauncher.ts
  *
  * Handles the core "bypass" behaviour: when a game is selected in the
- * Steam Deck library, immediately launch it and navigate away from the
- * game detail / preview page so the user never has to interact with it.
+ * Steam Deck library, check its launch state, then immediately launch it
+ * and navigate away from the game detail / preview page.
  *
  * Launch strategy
  * ---------------
- * 1. Call window.SteamClient.Apps.RunGame() – the same internal API Steam
- *    uses when the user presses Play on the detail page.
- * 2. Navigate back to /library so the detail page disappears while the
- *    game loads (Steam will switch focus to the game session automatically).
- *
- * Fallback strategy
- * -----------------
- * If SteamClient.Apps.RunGame is not available (future SteamOS API change),
- * we fall back to the steam://rungameid/<appId> URL scheme, which Valve
- * supports for external invocations and is very stable across versions.
+ * 1. Call getAppLaunchState() to classify the app (installed? running? etc.)
+ * 2. Handle the state:
+ *      - not_installed  → abort bypass; show toast; let detail page stay
+ *      - already_running / update_required / launchable / unknown
+ *                       → issue RunGame + navigate to /library
+ * 3. Primary launch: window.SteamClient.Apps.RunGame()
+ *    Fallback launch:  steam://rungameid/<appId> URL scheme
  *
  * Launch type constants
  * ---------------------
- * These are the values the Steam UI itself uses for the launchType parameter.
- * Passing the wrong value can result in the game not launching or launching
- * with the wrong Proton layer, so we detect the app type before calling.
- *
- *   LAUNCH_TYPE_DEFAULT  (-1)  – let Steam decide (safe fallback)
+ *   LAUNCH_TYPE_DEFAULT  (-1)  – let Steam decide (safe for multi-option games)
  *   LAUNCH_TYPE_GAME    (100)  – normal Steam game / Proton game
- *   LAUNCH_TYPE_SHORTCUT(104)  – non-Steam shortcut (added via "Add Non-Steam Game")
- *
- * Non-Steam shortcuts use a different appId range (>= 0x80000000 / 2147483648).
- * We detect this heuristically to pick the right launch type.
+ *   LAUNCH_TYPE_SHORTCUT(104)  – non-Steam shortcut (appId >= 0x80000000)
  */
 
-import { Navigation } from "@decky/api";
+import { Navigation, toaster } from "@decky/api";
+import { FaRocket } from "react-icons/fa";
+import { getAppLaunchState } from "./appStateChecker";
 import "../types/steamClient.d";
 
 // ------------------------------------------------------------------ //
@@ -42,17 +34,17 @@ import "../types/steamClient.d";
 /** Steam appId threshold above which an id is a non-Steam shortcut. */
 const NON_STEAM_APPID_THRESHOLD = 0x80000000; // 2 147 483 648
 
-/** launchType values passed to SteamClient.Apps.RunGame. */
-const LAUNCH_TYPE_DEFAULT = -1;
 const LAUNCH_TYPE_GAME = 100;
 const LAUNCH_TYPE_SHORTCUT = 104;
 
 /**
  * Milliseconds to wait after issuing RunGame before navigating back.
- * A small pause ensures Steam has registered the launch request before
- * the UI transitions away.
+ * A small pause ensures Steam registers the launch before the UI transitions.
  */
 const NAV_DELAY_MS = 80;
+
+/** Debounce window – ignores repeated calls within this many ms. */
+const DEBOUNCE_MS = 500;
 
 // ------------------------------------------------------------------ //
 // Helpers                                                              //
@@ -66,39 +58,22 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Determine the correct launchType for RunGame based on the appId.
- * Edge-case handling (e.g. Play / Continue prompts) is left to the next task.
- */
 function launchTypeFor(appId: number): number {
-  if (isNonSteamShortcut(appId)) return LAUNCH_TYPE_SHORTCUT;
-  return LAUNCH_TYPE_GAME;
+  return isNonSteamShortcut(appId) ? LAUNCH_TYPE_SHORTCUT : LAUNCH_TYPE_GAME;
 }
 
 // ------------------------------------------------------------------ //
-// Primary launch path – SteamClient.Apps.RunGame                      //
+// Primary launch – SteamClient.Apps.RunGame                           //
 // ------------------------------------------------------------------ //
 
-/**
- * Launch via the internal SteamClient API.
- * Returns true on success, false if the API is unavailable.
- */
 function tryRunGameAPI(appId: number): boolean {
   try {
-    if (
-      typeof window.SteamClient?.Apps?.RunGame !== "function"
-    ) {
-      console.warn(
-        "[QuickLaunch] SteamClient.Apps.RunGame not available – will fall back."
-      );
+    if (typeof window.SteamClient?.Apps?.RunGame !== "function") {
+      console.warn("[QuickLaunch] SteamClient.Apps.RunGame unavailable – falling back.");
       return false;
     }
-
     const type = launchTypeFor(appId);
-    console.log(
-      `[QuickLaunch] RunGame: appId=${appId} launchType=${type}`
-    );
-
+    console.log(`[QuickLaunch] RunGame: appId=${appId} launchType=${type}`);
     window.SteamClient.Apps.RunGame(String(appId), "", type, LAUNCH_TYPE_GAME);
     return true;
   } catch (err) {
@@ -108,13 +83,9 @@ function tryRunGameAPI(appId: number): boolean {
 }
 
 // ------------------------------------------------------------------ //
-// Fallback launch path – steam:// URL scheme                          //
+// Fallback – steam:// URL scheme                                       //
 // ------------------------------------------------------------------ //
 
-/**
- * Fallback: open the steam://rungameid URL scheme.
- * This works for both Steam games and non-Steam shortcuts.
- */
 function tryUrlSchemeFallback(appId: number): void {
   const url = `steam://rungameid/${appId}`;
   console.log(`[QuickLaunch] Fallback URL scheme: ${url}`);
@@ -122,45 +93,62 @@ function tryUrlSchemeFallback(appId: number): void {
 }
 
 // ------------------------------------------------------------------ //
-// Navigation – exit the detail page                                   //
+// Navigation                                                           //
 // ------------------------------------------------------------------ //
 
-/**
- * Navigate back to the library root.
- * We use Navigation.Navigate (from @decky/api) rather than history.back()
- * so the Steam router handles the transition cleanly and the detail page
- * doesn't remain in the forward-history stack.
- */
 function navigateToLibrary(): void {
   try {
     Navigation.Navigate("/library");
   } catch (err) {
-    // Navigation can fail if Steam's router is mid-transition; log and ignore.
     console.warn("[QuickLaunch] Navigation.Navigate failed:", err);
   }
+}
+
+// ------------------------------------------------------------------ //
+// Toast helpers                                                        //
+// ------------------------------------------------------------------ //
+
+function toastNotInstalled(): void {
+  toaster.toast({
+    title: "QuickLaunch",
+    body: "Game not installed – open the game page to install it first.",
+    icon: <FaRocket />,
+    duration: 4000,
+  });
+}
+
+function toastResuming(): void {
+  toaster.toast({
+    title: "QuickLaunch",
+    body: "Resuming game session…",
+    icon: <FaRocket />,
+    duration: 2000,
+  });
+}
+
+function toastUpdating(): void {
+  toaster.toast({
+    title: "QuickLaunch",
+    body: "Update pending – Steam will launch the game once it finishes.",
+    icon: <FaRocket />,
+    duration: 3000,
+  });
 }
 
 // ------------------------------------------------------------------ //
 // Debounce guard                                                       //
 // ------------------------------------------------------------------ //
 
-/**
- * Timestamp of the last launch attempt.  Prevents double-fires that can
- * occur when the route patch triggers more than once for the same navigation
- * (e.g. on React strict-mode double-render during development).
- */
 let _lastLaunchAt = 0;
-const DEBOUNCE_MS = 500;
 
 // ------------------------------------------------------------------ //
 // Public API                                                           //
 // ------------------------------------------------------------------ //
 
 /**
- * Bypass the game detail page and immediately launch the specified game.
- *
- * Call this from the onGameSelected handler (index.tsx) when the library
- * route patch detects that the user has selected a game.
+ * Check the game's launch state, then either:
+ *   • abort (not installed) – show toast, leave detail page visible, or
+ *   • bypass – launch via RunGame / URL scheme + navigate to /library.
  *
  * @param appId  The Steam appId of the selected game.
  */
@@ -168,24 +156,47 @@ export async function bypassAndLaunch(appId: number): Promise<void> {
   // Debounce: ignore rapid repeated calls for the same navigation event.
   const now = Date.now();
   if (now - _lastLaunchAt < DEBOUNCE_MS) {
-    console.log(
-      `[QuickLaunch] bypassAndLaunch debounced for appId=${appId}.`
-    );
+    console.log(`[QuickLaunch] bypassAndLaunch debounced for appId=${appId}.`);
     return;
   }
   _lastLaunchAt = now;
 
-  console.log(`[QuickLaunch] Bypassing detail page – launching appId=${appId}`);
+  // ── Classify the app ─────────────────────────────────────────────
+  const state = getAppLaunchState(appId);
+  console.log(`[QuickLaunch] Launch state for appId=${appId}: ${state}`);
 
-  // 1. Issue the launch command.
+  // ── Handle each state ────────────────────────────────────────────
+  switch (state) {
+    case "not_installed":
+      // Do NOT bypass: let the detail page stay so the user can install.
+      toastNotInstalled();
+      return; // early exit – no launch, no navigation
+
+    case "already_running":
+      // Game is running: RunGame will resume the session (bring it to focus).
+      // Still navigate away from the detail page so the library reappears.
+      toastResuming();
+      break; // fall through to launch
+
+    case "update_required":
+      // Steam will download the update then auto-launch.  Let it proceed.
+      toastUpdating();
+      break; // fall through to launch
+
+    case "launchable":
+    case "unknown":
+    default:
+      // Normal launch or unable to determine state → proceed optimistically.
+      break;
+  }
+
+  // ── Issue the launch command ──────────────────────────────────────
   const apiOk = tryRunGameAPI(appId);
   if (!apiOk) {
     tryUrlSchemeFallback(appId);
   }
 
-  // 2. Brief pause so Steam registers the launch before we navigate.
+  // ── Brief pause, then navigate away from the detail page ─────────
   await sleep(NAV_DELAY_MS);
-
-  // 3. Navigate back to the library – the detail page disappears.
   navigateToLibrary();
 }
