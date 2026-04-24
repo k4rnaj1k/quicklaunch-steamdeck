@@ -6,6 +6,8 @@
  * importing browser-only Decky APIs (routerHook, afterPatch, etc.).
  */
 
+import { toUnsignedAppId } from "./launchUtils";
+
 /**
  * Extract a numeric appId from the arguments that Steam passes to a
  * route's renderFunc.  Steam passes a params / match object as the first
@@ -16,8 +18,14 @@
  *   args[0] = { match: { params: { appid: "123456" } } }  (react-router v5)
  *   args[0] = { params: { appid: "123456" } }             (react-router v6)
  *
+ * Non-Steam shortcut appIds can arrive signed-negative when Steam's
+ * internals surface an int32 view of a uint32 value (appIds >= 0x80000000
+ * have the high bit set).  The returned value is normalised to its uint32
+ * representation via toUnsignedAppId() so callers can safely compare with
+ * `> 0` (any valid appId is non-zero after normalisation).
+ *
  * @param args  The raw arguments array passed to renderFunc.
- * @returns     A positive integer appId, or null if extraction failed.
+ * @returns     A uint32 appId, or null if extraction failed.
  */
 export function extractAppId(args: unknown[]): number | null {
   if (!args || args.length === 0) return null;
@@ -38,5 +46,8 @@ export function extractAppId(args: unknown[]): number | null {
   if (raw === null || raw === undefined) return null;
 
   const id = typeof raw === "number" ? raw : parseInt(raw as string, 10);
-  return isNaN(id) || id <= 0 ? null : id;
+  if (isNaN(id) || id === 0) return null;
+  // Normalise to uint32 so non-Steam shortcut appIds whose int32 view is
+  // negative (e.g. -1 for 0xFFFFFFFF) still pass downstream `> 0` checks.
+  return toUnsignedAppId(id);
 }

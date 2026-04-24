@@ -31,6 +31,7 @@ import {
   LAUNCH_TYPE_DEFAULT,
   LAUNCH_TYPE_GAME,
   launchTypeFor,
+  toUnsignedAppId,
 } from "../utils/launchUtils";
 
 // ------------------------------------------------------------------ //
@@ -58,19 +59,61 @@ function sleep(ms: number): Promise<void> {
 
 function tryRunGameAPI(appId: number): boolean {
   try {
+    // ── Normalise to uint32 ──────────────────────────────────────────
+    // Non-Steam shortcut appIds exceed the int32 range (they use the
+    // top bit).  Some upstream Steam paths hand these over signed-
+    // negative; normalising here guarantees downstream logic and the
+    // RunGame string conversion work on the correct uint32 value.
+    const rawAppId      = appId;
+    const unsignedAppId = toUnsignedAppId(appId);
+    const signedHex     = (rawAppId < 0 ? "-0x" + Math.abs(rawAppId).toString(16).toUpperCase()
+                                        :  "0x" + rawAppId.toString(16).toUpperCase());
+    const unsignedHex   = "0x" + unsignedAppId.toString(16).toUpperCase();
+    const inNonSteamRange = unsignedAppId >= 0x80000000;
+    const wasNegative   = rawAppId < 0;
+    console.log(
+      `[QuickLaunch] tryRunGameAPI: received appId=${rawAppId}` +
+      ` typeof=${typeof rawAppId}` +
+      ` signedHex=${signedHex}` +
+      ` normalised=${unsignedAppId}` +
+      ` unsignedHex=${unsignedHex}` +
+      ` wasNegative=${wasNegative}` +
+      ` inNonSteamRange(>=0x80000000)=${inNonSteamRange}` +
+      ` String(raw)="${String(rawAppId)}"` +
+      ` String(normalised)="${String(unsignedAppId)}"`
+    );
+    if (wasNegative) {
+      console.warn(
+        "[QuickLaunch] tryRunGameAPI: appId arrived NEGATIVE – normalising to uint32 before RunGame." +
+        ` (int32 view=${rawAppId}, uint32 view=${unsignedAppId}).`
+      );
+    } else if (inNonSteamRange) {
+      console.log(
+        `[QuickLaunch] tryRunGameAPI: appId is in expected non-Steam range` +
+        ` (>= 0x80000000). ok.`
+      );
+    }
+
     if (typeof window.SteamClient?.Apps?.RunGame !== "function") {
       console.warn("[QuickLaunch] SteamClient.Apps.RunGame unavailable – falling back.");
       return false;
     }
     // arg 3 = LAUNCH_TYPE_DEFAULT (-1): always let Steam choose the launch option.
     // arg 4 = launchTypeFor(appId):     100 for Steam games, 104 for non-Steam shortcuts.
-    const type = launchTypeFor(appId);
+    //
+    // We pass the unsigned-normalised value to both launchTypeFor and
+    // RunGame so the String() coercion yields the correct base-10
+    // decimal Steam expects for non-Steam shortcuts.
+    const type = launchTypeFor(unsignedAppId);
     console.log(
-      `[QuickLaunch] RunGame call: appId=${appId}` +
+      `[QuickLaunch] RunGame call: appId=${unsignedAppId} (${unsignedHex})` +
+      ` arg1(appIdStr)="${String(unsignedAppId)}"` +
       ` arg3(launchOptionIndex)=${LAUNCH_TYPE_DEFAULT}` +
-      ` arg4(launchType)=${type}`
+      ` arg4(launchType)=${type}` +
+      ` (${type === 104 ? "SHORTCUT" : "GAME"})`
     );
-    window.SteamClient.Apps.RunGame(String(appId), "", LAUNCH_TYPE_DEFAULT, type);
+    window.SteamClient.Apps.RunGame(String(unsignedAppId), "", LAUNCH_TYPE_DEFAULT, type);
+    console.log(`[QuickLaunch] RunGame: call returned without throwing for appId=${unsignedAppId}.`);
     return true;
   } catch (err) {
     console.error("[QuickLaunch] RunGame threw:", err);
@@ -83,8 +126,14 @@ function tryRunGameAPI(appId: number): boolean {
 // ------------------------------------------------------------------ //
 
 function tryUrlSchemeFallback(appId: number): void {
-  const url = `steam://rungameid/${appId}`;
-  console.log(`[QuickLaunch] Fallback URL scheme: ${url}`);
+  // Normalise to uint32 so a signed-negative non-Steam appId does not
+  // produce a "steam://rungameid/-1" URL, which Steam rejects.
+  const unsignedAppId = toUnsignedAppId(appId);
+  const url = `steam://rungameid/${unsignedAppId}`;
+  console.log(
+    `[QuickLaunch] Fallback URL scheme: ${url}` +
+    (appId !== unsignedAppId ? ` (normalised from ${appId})` : "")
+  );
   window.open(url, "_self");
 }
 
@@ -94,7 +143,12 @@ function tryUrlSchemeFallback(appId: number): void {
 
 function navigateToLibrary(): void {
   try {
+    console.log(
+      "[QuickLaunch] navigateToLibrary: invoking Navigation.NavigateBack()" +
+      ` (Navigation=${typeof Navigation} NavigateBack=${typeof Navigation?.NavigateBack})`
+    );
     Navigation.NavigateBack();
+    console.log("[QuickLaunch] navigateToLibrary: Navigation.NavigateBack() returned without throwing.");
   } catch (err) {
     console.warn("[QuickLaunch] NavigateBack failed:", err);
   }
@@ -170,6 +224,25 @@ let _lastLaunchAt    = 0;
  *          `false` if the bypass was aborted (game not installed).
  */
 export function prepareBypass(appId: number, navigateBack = true): boolean {
+  // Normalise once, at the earliest synchronous entry point, so every
+  // subsequent comparison, lookup, and downstream call works with the
+  // unsigned uint32 appId.  Without this the debounce cache would miss
+  // on a sign-flipped repeat and state/launch lookups would fail for
+  // non-Steam shortcuts whose int32 view is negative.
+  const rawAppId = appId;
+  appId = toUnsignedAppId(appId);
+  console.log(
+    `[QuickLaunch] prepareBypass: entry rawAppId=${rawAppId}` +
+    ` normalised=${appId} (0x${appId.toString(16).toUpperCase()})` +
+    ` navigateBack=${navigateBack}`
+  );
+  if (rawAppId !== appId) {
+    console.warn(
+      `[QuickLaunch] prepareBypass: normalised int32-signed appId` +
+      ` ${rawAppId} → uint32 ${appId} (non-Steam shortcut bit pattern).`
+    );
+  }
+
   // Per-appId debounce: suppress only if the same game fires again
   // within the window (e.g. history-listen + routerHook both trigger).
   // A different appId always bypasses the guard immediately.
@@ -189,6 +262,10 @@ export function prepareBypass(appId: number, navigateBack = true): boolean {
   switch (state) {
     case "not_installed":
       // Abort: keep the detail page visible so the user can install.
+      console.log(
+        `[QuickLaunch] prepareBypass: aborting for appId=${appId} – not_installed` +
+        ` (navigateBack=${navigateBack} ignored; detail page kept visible)`
+      );
       toastNotInstalled();
       return false;
 
@@ -212,8 +289,15 @@ export function prepareBypass(appId: number, navigateBack = true): boolean {
   // When the history.push was blocked upstream, the user never left the
   // current page so NavigateBack is not needed (and would be wrong).
   if (navigateBack) {
+    console.log(`[QuickLaunch] prepareBypass: navigateBack=true – calling navigateToLibrary() for appId=${appId}.`);
     navigateToLibrary();
+  } else {
+    console.log(
+      `[QuickLaunch] prepareBypass: navigateBack=false – skipping NavigateBack for appId=${appId}` +
+      " (push was blocked upstream; user never left current page)."
+    );
   }
+  console.log(`[QuickLaunch] prepareBypass: returning true for appId=${appId}.`);
   return true;
 }
 
@@ -234,6 +318,18 @@ export function prepareBypass(appId: number, navigateBack = true): boolean {
  * @param appId  The Steam appId of the game to launch.
  */
 export async function bypassAndLaunch(appId: number): Promise<void> {
+  // Normalise once at the public async entry point so every downstream
+  // call (tryRunGameAPI, tryUrlSchemeFallback) sees the uint32 form and
+  // so log lines reference a consistent value.
+  const rawAppId = appId;
+  appId = toUnsignedAppId(appId);
+  if (rawAppId !== appId) {
+    console.warn(
+      `[QuickLaunch] bypassAndLaunch: normalised int32-signed appId` +
+      ` ${rawAppId} → uint32 ${appId} at async entry.`
+    );
+  }
+
   // ── Attempt 1 ────────────────────────────────────────────────────
   if (tryRunGameAPI(appId)) return;
 

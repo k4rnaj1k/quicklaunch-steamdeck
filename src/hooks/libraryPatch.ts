@@ -25,6 +25,7 @@ import { routerHook } from "@decky/api";
 import { Router } from "@decky/ui";
 import { notifyGameSelected } from "../state/pluginState";
 import { extractAppId } from "../utils/routeUtils";
+import { toUnsignedAppId } from "../utils/launchUtils";
 
 // ------------------------------------------------------------------ //
 // Route patterns                                                       //
@@ -58,6 +59,19 @@ let _lastFiredAt   = 0;
  * @returns The boolean returned by the game-selected listener.
  */
 function fire(appId: number, source: string, navigate: boolean): boolean {
+  // Normalise at the module boundary so the debounce cache and the
+  // downstream listener always work on the uint32 form.  Non-Steam
+  // shortcut appIds (>= 0x80000000) may arrive signed-negative when
+  // they flow through Steam internals typed as int32.
+  const rawAppId = appId;
+  appId = toUnsignedAppId(appId);
+  if (rawAppId !== appId) {
+    console.warn(
+      `[QuickLaunch] fire: normalised int32-signed appId ${rawAppId}` +
+      ` → uint32 ${appId} (source=${source}).`
+    );
+  }
+
   const now = Date.now();
   if (appId === _lastFiredAppId && now - _lastFiredAt < DEBOUNCE_MS) return false;
   _lastFiredAppId = appId;
@@ -105,6 +119,13 @@ function findInTree(
 const PATCHED_FLAG = "__qlPatched";
 
 function patchLibraryRoute(tree: unknown): unknown {
+  // A navigation event has reached render-time, which means Router (and
+  // therefore Router.history) must be live by now.  Give Strategy 0 an
+  // opportunity to install itself immediately so subsequent navigations
+  // are caught pre-commit even if the initial backoff attempts all
+  // ran before Router.history was populated.
+  retryHistoryPushPatchNow();
+
   // ── Approach 1: extractAppId on tree root (React Router v5/v6) ────
   const appIdFromRoot = extractAppId([tree]);
   if (appIdFromRoot && appIdFromRoot > 0) {
@@ -148,8 +169,13 @@ function patchLibraryRoute(tree: unknown): unknown {
       nodeWithId["appId"] ??
       params?.["appid"] ??
       matchParams?.["appid"];
-    const appId = parseInt(String(raw), 10);
-    if (!isNaN(appId) && appId > 0) fire(appId, "deep-search", true);
+    const parsed = parseInt(String(raw), 10);
+    // Non-Steam shortcut appIds may arrive signed-negative (int32 view of
+    // a uint32 >= 0x80000000).  Normalise before the zero check so they
+    // are accepted here and passed through to fire(), which also
+    // normalises defensively.
+    const appId  = isNaN(parsed) ? NaN : toUnsignedAppId(parsed);
+    if (!isNaN(appId) && appId !== 0) fire(appId, "deep-search", true);
   } else {
     console.warn("[QuickLaunch] patchLibraryRoute fired but no appId found in tree.");
   }
@@ -176,13 +202,24 @@ function patchLibraryRoute(tree: unknown): unknown {
  * the history object is unavailable.
  */
 function tryPatchHistoryPush(): (() => void) | null {
+  console.log("[QuickLaunch] tryPatchHistoryPush: entry – attempting to patch Router.history.push/replace.");
   try {
-    const history = (Router as unknown as Record<string, unknown>)?.["history"] as
+    const routerRecord = Router as unknown as Record<string, unknown> | undefined;
+    console.log(
+      `[QuickLaunch] tryPatchHistoryPush: Router=${routerRecord ? "present" : "MISSING"}` +
+      ` history=${routerRecord?.["history"] ? "present" : "MISSING"}`
+    );
+
+    const history = routerRecord?.["history"] as
       | (Record<string, unknown> & { push: (...a: unknown[]) => void; replace?: (...a: unknown[]) => void })
       | undefined;
 
     if (!history || typeof history["push"] !== "function") {
-      console.warn("[QuickLaunch] Router.history.push not available for patching.");
+      console.warn(
+        "[QuickLaunch] Router.history.push not available for patching." +
+        ` history=${history ? "object" : "undefined"}` +
+        ` push=${typeof history?.["push"]}`
+      );
       return null;
     }
 
@@ -191,41 +228,67 @@ function tryPatchHistoryPush(): (() => void) | null {
       ? (history["replace"] as (...a: unknown[]) => void).bind(history)
       : null;
 
+    console.log(
+      `[QuickLaunch] tryPatchHistoryPush: capturing originals –` +
+      ` push=${typeof originalPush} replace=${originalReplace ? "fn" : "absent"}`
+    );
+
     function intercept(
       original: (...a: unknown[]) => void,
       location: unknown,
       state?: unknown,
+      kind: string = "push",
     ): void {
       const pathname =
         typeof location === "string"
           ? location
           : (location as Record<string, unknown> | null)?.["pathname"] as string | undefined;
 
+      console.log(
+        `[QuickLaunch] Strategy 0 intercept fired (${kind}):` +
+        ` pathname=${pathname ?? "<none>"}` +
+        ` locationType=${typeof location}`
+      );
+
       if (pathname) {
         const m = pathname.match(GAME_ROUTE_RE);
         if (m) {
           const appId = parseInt(m[1], 10);
+          console.log(
+            `[QuickLaunch] Strategy 0: matched game route – rawMatch="${m[1]}"` +
+            ` parsedAppId=${appId}`
+          );
           if (appId > 0) {
             // navigate=false: we are about to block the push, so the
             // overview page will never be entered and NavigateBack is wrong.
             const bypassed = fire(appId, "history-push", false);
+            console.log(
+              `[QuickLaunch] Strategy 0: fire() returned bypassed=${bypassed} for appId=${appId}` +
+              ` – ${bypassed ? "SWALLOWING" : "forwarding"} ${kind}`
+            );
             if (bypassed) {
               // Push swallowed – user stays on current page, game launches.
               return;
             }
             // Bypass aborted (e.g. not installed) – let the push through.
+          } else {
+            console.warn(
+              `[QuickLaunch] Strategy 0: matched game route but parsed appId<=0 (${appId}) – forwarding ${kind}`
+            );
           }
+        } else {
+          // Not a game route – nothing to do; forward silently.
         }
       }
       original(location, state);
     }
 
     history["push"] = (location: unknown, state?: unknown) =>
-      intercept(originalPush, location, state);
+      intercept(originalPush, location, state, "push");
 
     if (originalReplace) {
       history["replace"] = (location: unknown, state?: unknown) =>
-        intercept(originalReplace, location, state);
+        intercept(originalReplace, location, state, "replace");
     }
 
     console.log("[QuickLaunch] Router.history.push/replace patched (Strategy 0).");
@@ -238,6 +301,145 @@ function tryPatchHistoryPush(): (() => void) | null {
   } catch (err) {
     console.warn("[QuickLaunch] tryPatchHistoryPush error:", err);
     return null;
+  }
+}
+
+// ------------------------------------------------------------------ //
+// Strategy 0 – deferred retry wrapper                                  //
+// ------------------------------------------------------------------ //
+
+/**
+ * Backoff schedule used when Router.history is not yet available at
+ * plugin init.  Each entry is the delay (ms) before the next attempt.
+ * Total coverage: ~5.6 s after plugin init, which comfortably exceeds
+ * the longest observed Router bootstrap time.
+ */
+const PUSH_PATCH_RETRY_DELAYS_MS = [0, 100, 300, 700, 1500, 3000];
+
+// Module-scope state shared between the deferred-backoff retries and the
+// navigation-triggered retry.  These guard against double-installation
+// (which would stack wrappers on the already-patched push fn).
+let _pushPatchInstalled = false;
+let _pushPatchCancelled = false;
+let _pushPatchRestore: (() => void) | null = null;
+let _pushPatchRetryHandle: ReturnType<typeof setTimeout> | null = null;
+let _pushPatchAttempt = 0;
+
+/**
+ * Attempts to install the Strategy 0 push patch once.  If Router.history
+ * is not available yet, schedules further retries with backoff.  Returns
+ * a cleanup function that cancels pending retries and restores any
+ * successfully-installed patch.
+ *
+ * Additionally, Strategies 1 and 2 call retryHistoryPushPatchNow() when a
+ * navigation event fires – by that time Router.history is guaranteed to
+ * exist, so the patch can be installed synchronously for any subsequent
+ * navigations (the current one will not benefit, but rapid repeat
+ * A-presses will).
+ */
+function registerHistoryPushPatch(): () => void {
+  _pushPatchInstalled   = false;
+  _pushPatchCancelled   = false;
+  _pushPatchRestore     = null;
+  _pushPatchRetryHandle = null;
+  _pushPatchAttempt     = 0;
+
+  function runAttempt(): void {
+    _pushPatchRetryHandle = null;
+    if (_pushPatchCancelled || _pushPatchInstalled) return;
+
+    _pushPatchAttempt += 1;
+    console.log(
+      `[QuickLaunch] Strategy 0 patch: attempt #${_pushPatchAttempt}` +
+      ` of ${PUSH_PATCH_RETRY_DELAYS_MS.length}.`
+    );
+    const restore = tryPatchHistoryPush();
+    if (restore) {
+      _pushPatchInstalled = true;
+      _pushPatchRestore   = restore;
+      console.log(
+        `[QuickLaunch] Strategy 0 patch: installed on attempt #${_pushPatchAttempt}.`
+      );
+      return;
+    }
+    scheduleNextRetry();
+  }
+
+  function scheduleNextRetry(): void {
+    if (_pushPatchCancelled || _pushPatchInstalled) return;
+    if (_pushPatchAttempt >= PUSH_PATCH_RETRY_DELAYS_MS.length) {
+      console.warn(
+        "[QuickLaunch] Strategy 0 patch: giving up after" +
+        ` ${PUSH_PATCH_RETRY_DELAYS_MS.length} attempts.` +
+        " Strategies 1 & 2 will continue to handle game-page detection." +
+        " Navigation events will also trigger one more retry attempt."
+      );
+      return;
+    }
+    const delay = PUSH_PATCH_RETRY_DELAYS_MS[_pushPatchAttempt];
+    console.log(
+      `[QuickLaunch] Strategy 0 patch: scheduling retry #${_pushPatchAttempt + 1}` +
+      ` in ${delay} ms.`
+    );
+    _pushPatchRetryHandle = setTimeout(runAttempt, delay);
+  }
+
+  // Kick off the first attempt immediately.
+  scheduleNextRetry();
+
+  return () => {
+    _pushPatchCancelled = true;
+    if (_pushPatchRetryHandle !== null) {
+      clearTimeout(_pushPatchRetryHandle);
+      _pushPatchRetryHandle = null;
+      console.log("[QuickLaunch] Strategy 0 patch: pending retry cancelled during cleanup.");
+    }
+    if (_pushPatchRestore) {
+      try {
+        _pushPatchRestore();
+      } catch (err) {
+        console.warn("[QuickLaunch] Strategy 0 cleanup error:", err);
+      }
+      _pushPatchRestore = null;
+    }
+    _pushPatchInstalled = false;
+    _pushPatchAttempt   = 0;
+  };
+}
+
+/**
+ * Attempts an immediate patch install when triggered by a navigation
+ * event (from Strategy 1 or 2).  A no-op if the patch is already
+ * installed or cleanup has been requested.
+ *
+ * This covers the edge case where Router.history only becomes available
+ * after plugin init but before any of the scheduled backoff retries
+ * fire – without this path, the very first navigation would still be
+ * caught only by Strategies 1/2 (post-commit, overview flashes).
+ */
+function retryHistoryPushPatchNow(): void {
+  if (_pushPatchInstalled || _pushPatchCancelled) return;
+  if (_pushPatchRetryHandle !== null) {
+    clearTimeout(_pushPatchRetryHandle);
+    _pushPatchRetryHandle = null;
+  }
+  console.log(
+    "[QuickLaunch] Strategy 0 patch: navigation-triggered retry (Router.history is now proven live)."
+  );
+  _pushPatchAttempt += 1;
+  const restore = tryPatchHistoryPush();
+  if (restore) {
+    _pushPatchInstalled = true;
+    _pushPatchRestore   = restore;
+    console.log(
+      `[QuickLaunch] Strategy 0 patch: installed via navigation-triggered retry` +
+      ` (attempt #${_pushPatchAttempt}).`
+    );
+  } else {
+    console.warn(
+      "[QuickLaunch] Strategy 0 patch: navigation-triggered retry still could not install patch." +
+      " Continuing with Strategies 1 & 2."
+    );
   }
 }
 
@@ -260,6 +462,11 @@ function tryRegisterHistoryListener(): (() => void) | null {
     //   listen((location: Location, action: Action) => void): UnregisterCallback
     const unlisten = (history as { listen: (cb: (loc: unknown) => void) => () => void }).listen(
       (location: unknown) => {
+        // A navigation event has fired – Router.history is demonstrably
+        // alive.  Give Strategy 0 a chance to install itself right now so
+        // subsequent navigations are caught pre-commit.
+        retryHistoryPushPatchNow();
+
         // location may be a Location object or a string depending on RR version.
         const pathname =
           typeof location === "string"
@@ -300,10 +507,13 @@ export function registerLibraryPatch(): () => void {
   // ── Strategy 0: patch history.push/replace (pre-commit, best) ────
   // Intercepts navigation before the location commits, so the overview
   // page is never entered and NavigateBack is not needed.
-  const unpatchPush = tryPatchHistoryPush();
-  if (unpatchPush) {
-    cleanups.push(unpatchPush);
-  }
+  //
+  // registerHistoryPushPatch() returns a cleanup unconditionally: if the
+  // initial patch attempt fails (Router.history not yet available at
+  // plugin IIFE time), it schedules retries with backoff AND re-attempts
+  // on any subsequent navigation event observed via Strategies 1 or 2.
+  const unpatchPush = registerHistoryPushPatch();
+  cleanups.push(unpatchPush);
 
   // ── Strategy 1: history.listen (post-commit fallback) ────────────
   // Fires after the location has changed; NavigateBack is required.

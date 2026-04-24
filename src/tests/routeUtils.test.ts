@@ -101,11 +101,42 @@ describe("extractAppId – invalid / missing inputs", () => {
     expect(extractAppId([{ appid: "0" }])).toBeNull();
   });
 
-  it("returns null for a negative appid", () => {
-    expect(extractAppId([{ appid: "-1" }])).toBeNull();
-  });
-
   it("returns null when match.params is missing appid", () => {
     expect(extractAppId([{ match: { params: {} } }])).toBeNull();
+  });
+});
+
+// ------------------------------------------------------------------ //
+// Signed-int32 normalisation (non-Steam shortcuts)                     //
+// ------------------------------------------------------------------ //
+
+describe("extractAppId – signed-int32 non-Steam shortcut appIds", () => {
+  // Non-Steam shortcuts use uint32 values with the high bit set.
+  // When Steam surfaces them through an int32-typed field, they show
+  // up in JS as signed-negative numbers.  extractAppId normalises
+  // these to their uint32 representation so downstream code sees a
+  // valid positive appId.
+
+  it("normalises numeric -1 to 0xFFFFFFFF", () => {
+    expect(extractAppId([{ appid: -1 }])).toBe(0xffffffff);
+  });
+
+  it("normalises string '-1' to 0xFFFFFFFF", () => {
+    expect(extractAppId([{ appid: "-1" }])).toBe(0xffffffff);
+  });
+
+  it("normalises numeric -0x80000000 to 0x80000000 (threshold)", () => {
+    expect(extractAppId([{ appid: -0x80000000 }])).toBe(0x80000000);
+  });
+
+  it("normalises a realistic signed-int32 non-Steam shortcut", () => {
+    // int32 bit pattern of uint32 0x80215442 is a negative JS number.
+    expect(extractAppId([{ appid: -0x7fdeadbe }])).toBe(0x80215442);
+  });
+
+  it("preserves positive non-Steam shortcut appId unchanged", () => {
+    // Regression guard: normalisation must be a no-op for already-unsigned inputs.
+    const appId = 0x80000000 + 12345;
+    expect(extractAppId([{ appid: String(appId) }])).toBe(appId);
   });
 });

@@ -17,6 +17,7 @@ import {
   LAUNCH_TYPE_SHORTCUT,
   isNonSteamShortcut,
   launchTypeFor,
+  toUnsignedAppId,
 } from "../utils/launchUtils";
 
 // ------------------------------------------------------------------ //
@@ -140,5 +141,108 @@ describe("launchTypeFor", () => {
     it("boundary: first non-Steam appId (0x80000000) → LAUNCH_TYPE_SHORTCUT", () => {
       expect(launchTypeFor(NON_STEAM_APPID_THRESHOLD)).toBe(LAUNCH_TYPE_SHORTCUT);
     });
+  });
+});
+
+// ------------------------------------------------------------------ //
+// toUnsignedAppId                                                      //
+// ------------------------------------------------------------------ //
+
+describe("toUnsignedAppId", () => {
+  describe("values already in uint32 range are returned unchanged", () => {
+    const noops: [string, number][] = [
+      ["zero", 0],
+      ["Half-Life 2 (220)", 220],
+      ["Cyberpunk 2077 (1091500)", 1091500],
+      ["max int32 (0x7FFFFFFF)", 0x7fffffff],
+      ["first uint32 high bit (0x80000000)", 0x80000000],
+      ["near-max uint32 (0xFFFFFF00)", 0xffffff00],
+      ["max uint32 (0xFFFFFFFF)", 0xffffffff],
+    ];
+
+    it.each(noops)("%s – appId %i", (_name, appId) => {
+      expect(toUnsignedAppId(appId)).toBe(appId);
+    });
+  });
+
+  describe("signed-negative inputs are normalised to their uint32 bit pattern", () => {
+    // Steam surfaces uint32 non-Steam shortcut appIds as signed int32s
+    // in some code paths.  These tests assert that the bit pattern is
+    // preserved: negative values map to their unsigned counterpart.
+    const pairs: [string, number, number][] = [
+      ["-1 → 0xFFFFFFFF", -1, 0xffffffff],
+      ["-2 → 0xFFFFFFFE", -2, 0xfffffffe],
+      ["-0x80000000 → 0x80000000 (threshold)", -0x80000000, 0x80000000],
+      [
+        "realistic signed non-Steam shortcut",
+        -0x7fdeadbe /* int32 bit pattern of uint32 0x80215442 */,
+        0x80215442,
+      ],
+    ];
+
+    it.each(pairs)("%s", (_name, raw, expected) => {
+      expect(toUnsignedAppId(raw)).toBe(expected);
+    });
+  });
+
+  describe("degenerate inputs are passed through unchanged", () => {
+    // Non-finite / non-number inputs are out-of-contract but should not
+    // throw.  We return them as-is so the caller can log a warning
+    // rather than inherit a silent NaN/0 downstream.
+    it("NaN passes through as NaN", () => {
+      expect(Number.isNaN(toUnsignedAppId(Number.NaN))).toBe(true);
+    });
+
+    it("Infinity passes through as Infinity", () => {
+      expect(toUnsignedAppId(Number.POSITIVE_INFINITY)).toBe(Number.POSITIVE_INFINITY);
+    });
+  });
+});
+
+// ------------------------------------------------------------------ //
+// isNonSteamShortcut / launchTypeFor — signed-int32 inputs             //
+// ------------------------------------------------------------------ //
+
+describe("isNonSteamShortcut with signed-int32 inputs (int-overflow)", () => {
+  // These cover the Steam internals path where a uint32 appId >= 0x80000000
+  // is surfaced as a signed-negative JS number because the C++ producer
+  // typed the value as int32.  Without normalisation the `>= threshold`
+  // check would incorrectly classify these as Steam games (launchType 100)
+  // and RunGame would be invoked with the wrong arguments.
+
+  it("−1 (int32 view of 0xFFFFFFFF) is a non-Steam shortcut", () => {
+    expect(isNonSteamShortcut(-1)).toBe(true);
+  });
+
+  it("−0x80000000 (int32 view of 0x80000000 = threshold) is a non-Steam shortcut", () => {
+    expect(isNonSteamShortcut(-0x80000000)).toBe(true);
+  });
+
+  it("a realistic signed-non-Steam appId is classified as non-Steam shortcut", () => {
+    // int32 bit pattern of uint32 0x80215442 (a plausible shortcut id)
+    expect(isNonSteamShortcut(-0x7fdeadbe)).toBe(true);
+  });
+
+  it("positive Steam game appId is still classified as a Steam game", () => {
+    // Regression guard: normalising must not flip positive values.
+    expect(isNonSteamShortcut(1091500)).toBe(false);
+  });
+});
+
+describe("launchTypeFor with signed-int32 inputs (int-overflow)", () => {
+  it("−1 → LAUNCH_TYPE_SHORTCUT (104)", () => {
+    expect(launchTypeFor(-1)).toBe(LAUNCH_TYPE_SHORTCUT);
+  });
+
+  it("−0x80000000 → LAUNCH_TYPE_SHORTCUT (104)", () => {
+    expect(launchTypeFor(-0x80000000)).toBe(LAUNCH_TYPE_SHORTCUT);
+  });
+
+  it("realistic signed non-Steam appId → LAUNCH_TYPE_SHORTCUT (104)", () => {
+    expect(launchTypeFor(-0x7fdeadbe)).toBe(LAUNCH_TYPE_SHORTCUT);
+  });
+
+  it("positive Steam game appId is still LAUNCH_TYPE_GAME (100)", () => {
+    expect(launchTypeFor(1091500)).toBe(LAUNCH_TYPE_GAME);
   });
 });
