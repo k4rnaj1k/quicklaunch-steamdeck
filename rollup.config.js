@@ -20,14 +20,13 @@ export default {
       publicPath: `http://127.0.0.1:1337/plugins/QuickLaunch/`,
     }),
   ],
-  external: ["react", "react-dom", "@decky/ui", "@decky/api"],
+  external: ["react", "react-dom", "@decky/ui"],
   output: {
     file: "dist/index.js",
     globals: {
       react: "SP_REACT",
       "react-dom": "SP_REACTDOM",
       "@decky/ui": "DFL",
-      "@decky/api": "DeckyPluginAPI",
     },
     format: "iife",
     exports: "default",
