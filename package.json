@@ -28,6 +28,7 @@
     "rollup-plugin-import-assets": "^1.1.1",
     "shx": "^0.3.4",
     "tslib": "^2.6.2",
+    "react-icons": "^4.12.0",
     "typescript": "^5.3.3"
   },
   "peerDependencies": {
