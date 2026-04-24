@@ -91,9 +91,17 @@ function tryUrlSchemeFallback(appId: number): void {
 
 function navigateToLibrary(): void {
   try {
-    Navigation.Navigate("/library");
+    // NavigateBack is the safest: returns the user to wherever they came from
+    // (always the library grid when opening a game overview).
+    // Fall back to window.history.back() if Navigation is unavailable.
+    if (typeof Navigation?.NavigateBack === "function") {
+      Navigation.NavigateBack();
+    } else {
+      window.history.back();
+    }
   } catch (err) {
-    console.warn("[QuickLaunch] Navigation.Navigate failed:", err);
+    console.warn("[QuickLaunch] navigation failed, trying history.back():", err);
+    try { window.history.back(); } catch (_) { /* ignore */ }
   }
 }
 

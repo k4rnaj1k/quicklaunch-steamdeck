@@ -1,52 +1,40 @@
 /**
  * libraryPatch.ts
  *
- * Registers a Decky routerHook patch on the Steam library game-detail route
- * (/library/app/:appid).  When Steam navigates to a game's detail page
- * (user selects a game and presses A), the patch fires, reads the appId
- * from the current URL, and schedules the bypass via setTimeout so it runs
- * outside the React render cycle.
+ * Detects when the Steam UI navigates to a game's detail page by patching
+ * window.history.pushState — the underlying browser API that React Router
+ * calls for every client-side navigation.  This is version-agnostic: it
+ * works regardless of the SteamOS React Router version or the exact route
+ * path string used internally.
  *
- * Why URL-based detection instead of findInReactTree/afterPatch:
- *   The React tree structure varies across SteamOS versions — findInReactTree
- *   looking for a renderFunc node is fragile and silently no-ops when the
- *   node shape changes.  Reading window.location.pathname is version-agnostic
- *   and always reliable when the route has matched.
+ * We also keep a routerHook.addPatch as a secondary signal in case Steam
+ * routes the navigation differently on some firmware versions.
+ *
+ * Detection: /library/app/<appid> in the pushed URL
+ * Navigation back: window.history.back() — always reliable
  */
 
 import { routerHook } from "@decky/api";
 import { notifyGameSelected } from "../state/pluginState";
 
-/** The Steam router path for a game's detail / preview page. */
 const LIBRARY_APP_ROUTE = "/library/app/:appid";
-
-/** Regex to pull the numeric appId out of the current pathname. */
 const APP_PATH_RE = /\/library\/app\/(\d+)/;
 
 // ------------------------------------------------------------------ //
-// Route patcher                                                        //
+// Helpers                                                              //
 // ------------------------------------------------------------------ //
 
-function patchLibraryRoute(tree: unknown): unknown {
-  const match = window.location.pathname.match(APP_PATH_RE);
-  if (!match) {
-    console.warn("[QuickLaunch] libraryPatch: route fired but pathname did not match.", window.location.pathname);
-    return tree;
-  }
+function tryExtractAndFire(url: string | URL | null | undefined): void {
+  if (!url) return;
+  const str = typeof url === "string" ? url : url.toString();
+  const match = str.match(APP_PATH_RE);
+  if (!match) return;
 
   const appId = parseInt(match[1], 10);
-  if (isNaN(appId) || appId <= 0) {
-    console.warn("[QuickLaunch] libraryPatch: parsed appId is invalid:", match[1]);
-    return tree;
-  }
+  if (isNaN(appId) || appId <= 0) return;
 
-  console.log(`[QuickLaunch] libraryPatch: detected appId=${appId}, scheduling bypass.`);
-
-  // Defer outside the render cycle so React doesn't see a navigation
-  // triggered synchronously during a route render.
+  console.log(`[QuickLaunch] detected navigation to appId=${appId}`);
   setTimeout(() => notifyGameSelected(appId), 0);
-
-  return tree;
 }
 
 // ------------------------------------------------------------------ //
@@ -54,11 +42,39 @@ function patchLibraryRoute(tree: unknown): unknown {
 // ------------------------------------------------------------------ //
 
 export function registerLibraryPatch(): () => void {
-  const patch = routerHook.addPatch(LIBRARY_APP_ROUTE, patchLibraryRoute);
-  console.log(`[QuickLaunch] Registered library route patch on "${LIBRARY_APP_ROUTE}".`);
+  // ── Primary: intercept pushState ────────────────────────────────────
+  // React Router calls history.pushState for every SPA navigation.
+  // Patching here catches the navigation before any route component renders.
+  const originalPushState = window.history.pushState.bind(window.history);
 
+  window.history.pushState = function (
+    state: unknown,
+    title: string,
+    url?: string | URL | null,
+  ) {
+    const result = originalPushState(state, title, url);
+    tryExtractAndFire(url);
+    return result;
+  };
+
+  // ── Secondary: routerHook.addPatch ───────────────────────────────────
+  // Fires during React render of the matched route — catches cases where
+  // Steam uses replaceState instead of pushState, or for re-renders.
+  const routerPatch = routerHook.addPatch(
+    LIBRARY_APP_ROUTE,
+    (tree: unknown) => {
+      // At render time the URL should already be updated.
+      tryExtractAndFire(window.location.pathname);
+      return tree;
+    },
+  );
+
+  console.log("[QuickLaunch] Library patch registered (pushState + routerHook).");
+
+  // ── Cleanup ──────────────────────────────────────────────────────────
   return () => {
-    routerHook.removePatch(LIBRARY_APP_ROUTE, patch);
-    console.log("[QuickLaunch] Removed library route patch.");
+    window.history.pushState = originalPushState;
+    routerHook.removePatch(LIBRARY_APP_ROUTE, routerPatch);
+    console.log("[QuickLaunch] Library patch removed.");
   };
 }
