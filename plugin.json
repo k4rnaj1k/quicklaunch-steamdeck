@@ -1,0 +1,10 @@
+{
+  "name": "QuickLaunch",
+  "author": "vladliasota@gmail.com",
+  "flags": [],
+  "publish": {
+    "description": "Launch games instantly from the Steam Deck library without navigating through the game detail/preview page.",
+    "tags": ["utility", "games", "library"],
+    "image": "https://i.imgur.com/placeholder.png"
+  }
+}
