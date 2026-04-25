@@ -175,8 +175,8 @@ describe("toUnsignedAppId", () => {
       ["-0x80000000 → 0x80000000 (threshold)", -0x80000000, 0x80000000],
       [
         "realistic signed non-Steam shortcut",
-        -0x7fdeadbe /* int32 bit pattern of uint32 0x80215442 */,
-        0x80215442,
+        -0x7fdeadbe /* int32 bit pattern of uint32 0x80215242 */,
+        0x80215242,
       ],
     ];
 
@@ -219,7 +219,7 @@ describe("isNonSteamShortcut with signed-int32 inputs (int-overflow)", () => {
   });
 
   it("a realistic signed-non-Steam appId is classified as non-Steam shortcut", () => {
-    // int32 bit pattern of uint32 0x80215442 (a plausible shortcut id)
+    // int32 bit pattern of uint32 0x80215242 (a plausible shortcut id)
     expect(isNonSteamShortcut(-0x7fdeadbe)).toBe(true);
   });
 

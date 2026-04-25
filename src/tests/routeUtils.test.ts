@@ -130,8 +130,8 @@ describe("extractAppId – signed-int32 non-Steam shortcut appIds", () => {
   });
 
   it("normalises a realistic signed-int32 non-Steam shortcut", () => {
-    // int32 bit pattern of uint32 0x80215442 is a negative JS number.
-    expect(extractAppId([{ appid: -0x7fdeadbe }])).toBe(0x80215442);
+    // int32 bit pattern of uint32 0x80215242 is a negative JS number.
+    expect(extractAppId([{ appid: -0x7fdeadbe }])).toBe(0x80215242);
   });
 
   it("preserves positive non-Steam shortcut appId unchanged", () => {
