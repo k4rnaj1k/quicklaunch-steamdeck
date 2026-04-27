@@ -4,25 +4,32 @@
  * Detects when the Steam UI navigates to a game's detail page and fires
  * notifyGameSelected() so the bypass logic can run.
  *
- * Three complementary detection strategies are layered so that at least
+ * Four complementary detection strategies are layered so that at least
  * one fires on every SteamOS/Decky version combination:
  *
- *   0. Router.history.push patch – intercepts the push *before* the
- *      location commits.  The push is swallowed for launchable games so
- *      the overview page is never entered and NavigateBack is not needed.
- *      Best strategy; eliminates the overview flash entirely.
+ *   0.  Router.history.push patch – intercepts the push *before* the
+ *       location commits.  The push is swallowed for launchable games so
+ *       the overview page is never entered and NavigateBack is not needed.
+ *       Best strategy; eliminates the overview flash entirely.
  *
- *   1. Router.history.listen()   – fires *after* the location changes.
- *      NavigateBack() is required to dismiss the overview.  Fallback when
- *      Strategy 0 is unavailable or when Strategy 0 lets the push through
- *      (not-installed case handled upstream; debounce blocks double-fire).
+ *   0b. Navigation.Navigate patch – same pre-commit semantics as
+ *       Strategy 0, but covers the @decky/ui code path.  Some SteamOS
+ *       versions route the "A on tile" action through
+ *       Navigation.Navigate(path) rather than Router.history.push(path);
+ *       this strategy catches those.  Per-appId debounce in fire()
+ *       prevents double-firing if Steam ever calls both for the same press.
  *
- *   2. routerHook.addPatch()     – patches the /library/app/:appid route's
- *      render tree.  Fires at render time.  Last-resort fallback.
+ *   1.  Router.history.listen()  – fires *after* the location changes.
+ *       NavigateBack() is required to dismiss the overview.  Fallback when
+ *       Strategies 0 / 0b are unavailable or when they let the push through
+ *       (not-installed case handled upstream; debounce blocks double-fire).
+ *
+ *   2.  routerHook.addPatch()    – patches the /library/app/:appid route's
+ *       render tree.  Fires at render time.  Last-resort fallback.
  */
 
 import { routerHook } from "@decky/api";
-import { Router } from "@decky/ui";
+import { Router, Navigation } from "@decky/ui";
 import { notifyGameSelected } from "../state/pluginState";
 import { extractAppId } from "../utils/routeUtils";
 import { toUnsignedAppId } from "../utils/launchUtils";
@@ -444,6 +451,105 @@ function retryHistoryPushPatchNow(): void {
 }
 
 // ------------------------------------------------------------------ //
+// Strategy 0b – patch Navigation.Navigate (pre-commit, complementary) //
+// ------------------------------------------------------------------ //
+
+/**
+ * Some SteamOS / @decky/ui versions route the "A on tile" action through
+ * `Navigation.Navigate(path)` rather than `Router.history.push(path)`.
+ * Strategy 0 misses this entirely, leaving Strategies 1 / 2 to clean up
+ * post-commit – which is exactly the flash the user reports.
+ *
+ * This patch wraps `Navigation.Navigate` with the same intercept logic
+ * as Strategy 0: if the destination is a game-detail route, we fire the
+ * bypass with `navigate=false` (so no NavigateBack is needed) and swallow
+ * the call when the bypass succeeds.  Otherwise the call is forwarded
+ * unchanged.
+ *
+ * The patch is additive – Strategy 0 stays in place, both can coexist
+ * without interfering (the per-appId debounce in `fire()` blocks any
+ * double-fire if Steam happens to call both Navigation.Navigate AND
+ * Router.history.push for the same press).
+ *
+ * Returns a cleanup function that restores the original, or null if
+ * Navigation.Navigate is unavailable.
+ */
+function tryPatchNavigationNavigate(): (() => void) | null {
+  console.log("[QuickLaunch] tryPatchNavigationNavigate: entry – attempting to patch Navigation.Navigate.");
+  try {
+    const navRecord = Navigation as unknown as Record<string, unknown> | undefined;
+    console.log(
+      `[QuickLaunch] tryPatchNavigationNavigate: Navigation=${navRecord ? "present" : "MISSING"}` +
+      ` Navigate=${typeof navRecord?.["Navigate"]}`
+    );
+
+    if (!navRecord || typeof navRecord["Navigate"] !== "function") {
+      console.warn(
+        "[QuickLaunch] Navigation.Navigate not available for patching." +
+        ` Navigation=${navRecord ? "object" : "undefined"}` +
+        ` Navigate=${typeof navRecord?.["Navigate"]}`
+      );
+      return null;
+    }
+
+    const original = (navRecord["Navigate"] as (...a: unknown[]) => void).bind(Navigation);
+
+    navRecord["Navigate"] = (location: unknown, ...rest: unknown[]) => {
+      const pathname =
+        typeof location === "string"
+          ? location
+          : (location as Record<string, unknown> | null)?.["pathname"] as string | undefined;
+
+      console.log(
+        `[QuickLaunch] Strategy 0b intercept fired (Navigation.Navigate):` +
+        ` pathname=${pathname ?? "<none>"} locationType=${typeof location}`
+      );
+
+      if (pathname) {
+        const m = pathname.match(GAME_ROUTE_RE);
+        if (m) {
+          const appId = parseInt(m[1], 10);
+          console.log(
+            `[QuickLaunch] Strategy 0b: matched game route – rawMatch="${m[1]}"` +
+            ` parsedAppId=${appId}`
+          );
+          if (appId > 0) {
+            // navigate=false: we are about to block the call, so the
+            // overview page is never entered and NavigateBack is wrong.
+            const bypassed = fire(appId, "navigation-navigate", false);
+            console.log(
+              `[QuickLaunch] Strategy 0b: fire() returned bypassed=${bypassed} for appId=${appId}` +
+              ` – ${bypassed ? "SWALLOWING" : "forwarding"} Navigation.Navigate`
+            );
+            if (bypassed) {
+              // Call swallowed – user stays on current page, game launches.
+              return;
+            }
+            // Bypass aborted (e.g. not installed) – let the call through.
+          } else {
+            console.warn(
+              `[QuickLaunch] Strategy 0b: matched game route but parsed appId<=0 (${appId})` +
+              ` – forwarding Navigation.Navigate`
+            );
+          }
+        }
+      }
+      return original(location, ...rest);
+    };
+
+    console.log("[QuickLaunch] Navigation.Navigate patched (Strategy 0b).");
+
+    return () => {
+      navRecord["Navigate"] = original;
+      console.log("[QuickLaunch] Navigation.Navigate restored.");
+    };
+  } catch (err) {
+    console.warn("[QuickLaunch] tryPatchNavigationNavigate error:", err);
+    return null;
+  }
+}
+
+// ------------------------------------------------------------------ //
 // Strategy 1 – Router.history.listen()                                //
 // ------------------------------------------------------------------ //
 
@@ -514,6 +620,17 @@ export function registerLibraryPatch(): () => void {
   // on any subsequent navigation event observed via Strategies 1 or 2.
   const unpatchPush = registerHistoryPushPatch();
   cleanups.push(unpatchPush);
+
+  // ── Strategy 0b: patch Navigation.Navigate (pre-commit, complementary) ──
+  // Some SteamOS versions route the "A on tile" action through
+  // Navigation.Navigate(path) rather than Router.history.push(path).
+  // Strategy 0 misses these; Strategy 0b catches them with the same
+  // pre-commit semantics.  Per-appId debounce in fire() prevents any
+  // double-firing if Steam ever calls both for the same press.
+  const unpatchNavigate = tryPatchNavigationNavigate();
+  if (unpatchNavigate) {
+    cleanups.push(unpatchNavigate);
+  }
 
   // ── Strategy 1: history.listen (post-commit fallback) ────────────
   // Fires after the location has changed; NavigateBack is required.
