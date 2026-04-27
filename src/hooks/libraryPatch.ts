@@ -4,31 +4,39 @@
  * Detects when the Steam UI navigates to a game's detail page and fires
  * notifyGameSelected() so the bypass logic can run.
  *
- * Three complementary detection strategies are layered so that at least
- * one fires on every SteamOS/Decky version combination:
+ * Four complementary detection strategies are layered so that at least
+ * one fires on every SteamOS / Decky version combination.  None of
+ * them call NavigateBack any more – Steam's own launch animation
+ * covers the overview when RunGame is issued.  The strategies are:
  *
  *   0.  Router.history.push patch – intercepts the push *before* the
- *       location commits.  The push is swallowed for launchable games so
- *       the overview page is never entered.  Best strategy on builds
- *       where Steam routes "A on tile" through Router.history.push.
+ *       location commits.  The push is swallowed for launchable games
+ *       so the overview page is never entered.  Best strategy on
+ *       builds that route "A on tile" through Router.history.push.
  *
- *   0b. Navigation.Navigate patch – same pre-commit semantics as Strategy
- *       0, but covers the @decky/ui code path.  Some SteamOS versions
- *       route the "A on tile" action through Navigation.Navigate(path)
- *       rather than Router.history.push(path); this strategy catches
- *       those.  Per-appId debounce in fire() prevents double-firing.
+ *   0b. Navigation.Navigate patch – same pre-commit semantics as
+ *       Strategy 0, but covers the @decky/ui code path.  Some SteamOS
+ *       versions route the "A on tile" action through
+ *       Navigation.Navigate(path) rather than Router.history.push(path);
+ *       this strategy catches those.
  *
- *   2.  routerHook.addPatch() – injects a tiny <QuickLaunchAutoLauncher>
- *       component into the /library/app/:appid render tree that fires
- *       `notifyGameSelected` from a useLayoutEffect.  The effect runs
- *       before paint, so when Steam's launch animation kicks in quickly
- *       enough the overview content is never visibly committed to the
- *       screen.  Last-resort fallback when Strategies 0 / 0b miss.
+ *   1.  Router.history.listen() – pure observer that fires after the
+ *       location commits.  No NavigateBack; this is a catch-all
+ *       safety net for builds where Strategies 0 / 0b / 2 all miss.
+ *       The user briefly sees the overview before Steam's launch
+ *       animation takes over – the alternative is the bypass not
+ *       running at all.
  *
- * The previous Strategy 1 (Router.history.listen) has been removed –
- * it only existed to drive NavigateBack, which we no longer call.
- * Steam's own launch animation now covers the overview, so post-commit
- * fallbacks are no longer needed.
+ *   2.  routerHook.addPatch() – patches the /library/app/:appid route
+ *       and fires twice for resilience: (a) a synchronous fire during
+ *       the patcher callback so the bypass triggers even when the
+ *       wrapping element below is not honoured by Decky's renderer,
+ *       and (b) an injected <QuickLaunchAutoLauncher> component whose
+ *       useLayoutEffect fires before paint on builds that *do* honour
+ *       the wrapper.
+ *
+ * The per-appId debounce in fire() makes all four strategies safe to
+ * layer; whichever fires first wins, the rest are suppressed.
  */
 
 import React, { useLayoutEffect } from "react";
@@ -226,10 +234,26 @@ function patchLibraryRoute(tree: unknown): unknown {
     return tree;
   }
 
-  // Inject the auto-launcher above the original tree.  Using a key tied
-  // to the appId guarantees React remounts the component (and re-runs
-  // useLayoutEffect) whenever the user navigates between two different
-  // games without the route element itself unmounting first.
+  // Belt-and-suspenders fire #1 – synchronous, during render.
+  //
+  // This is what the old Strategy 2 did before v1.4.0.  It works even
+  // when Decky's routerHook implementation does not honour a wrapping
+  // element returned from the patcher (some builds render the original
+  // tree directly and ignore wrappers, in which case the
+  // useLayoutEffect injection below never mounts).  The per-appId
+  // debounce in fire() prevents this from double-firing with the
+  // useLayoutEffect path on builds where both run.
+  fire(appId, "patchLibraryRoute-sync");
+
+  // Belt-and-suspenders fire #2 – useLayoutEffect injection.
+  //
+  // On builds where the wrapping element IS honoured, the component
+  // mounts, useLayoutEffect runs before paint, fire() is called.
+  // The debounce immediately suppresses it as a duplicate of fire #1.
+  // We keep the injection so that if any future Steam build *only*
+  // fires the patcher with a tree shape we cannot extract appId from
+  // (and therefore fire #1 was skipped), the component still mounts
+  // when the route renders and the effect can re-attempt detection.
   return React.createElement(
     React.Fragment,
     null,
@@ -590,6 +614,73 @@ function tryPatchNavigationNavigate(): (() => void) | null {
 }
 
 // ------------------------------------------------------------------ //
+// Strategy 1 – Router.history.listen() (pure observer)                 //
+// ------------------------------------------------------------------ //
+
+/**
+ * Pure observer: subscribes to Router.history.listen and fires
+ * notifyGameSelected whenever the location commits to a game-detail
+ * route.
+ *
+ * Originally Strategy 1 also drove `Navigation.NavigateBack` to dismiss
+ * the overview after firing.  The NavigateBack call has been removed –
+ * Steam's own launch animation now covers the overview – but the
+ * listener is still valuable as a *catch-all safety net* on builds
+ * where every other strategy misses (Router.history.push not patched,
+ * Navigation.Navigate not patched, and the routerHook route patch's
+ * tree wrapper / useLayoutEffect injection both fail to fire).
+ *
+ * The per-appId debounce in fire() prevents this from double-firing
+ * with any of Strategies 0 / 0b / 2 on builds where multiple paths
+ * succeed.
+ *
+ * Returns a cleanup function that unregisters the listener, or null
+ * if Router.history.listen is not available.
+ */
+function tryRegisterHistoryListener(): (() => void) | null {
+  try {
+    const history = (Router as unknown as Record<string, unknown>)?.["history"];
+    if (!history || typeof (history as Record<string, unknown>)["listen"] !== "function") {
+      console.warn("[QuickLaunch] Router.history.listen not available.");
+      return null;
+    }
+
+    const unlisten = (history as { listen: (cb: (loc: unknown) => void) => () => void }).listen(
+      (location: unknown) => {
+        // A navigation event has fired – Router.history is demonstrably
+        // alive.  Give Strategy 0 a chance to install itself right now
+        // so subsequent navigations are caught pre-commit.
+        retryHistoryPushPatchNow();
+
+        const pathname =
+          typeof location === "string"
+            ? location
+            : (location as Record<string, unknown>)?.["pathname"] as string | undefined;
+
+        if (!pathname) return;
+
+        const m = pathname.match(GAME_ROUTE_RE);
+        if (!m) return;
+
+        const appId = parseInt(m[1], 10);
+        if (appId > 0) fire(appId, "history-listen");
+      }
+    );
+
+    if (typeof unlisten !== "function") {
+      console.warn("[QuickLaunch] Router.history.listen did not return a cleanup fn.");
+      return null;
+    }
+
+    console.log("[QuickLaunch] Router.history.listen registered (pure observer).");
+    return unlisten;
+  } catch (err) {
+    console.warn("[QuickLaunch] tryRegisterHistoryListener error:", err);
+    return null;
+  }
+}
+
+// ------------------------------------------------------------------ //
 // Public API                                                           //
 // ------------------------------------------------------------------ //
 
@@ -603,7 +694,7 @@ export function registerLibraryPatch(): () => void {
   // registerHistoryPushPatch() returns a cleanup unconditionally: if the
   // initial patch attempt fails (Router.history not yet available at
   // plugin IIFE time), it schedules retries with backoff AND re-attempts
-  // on any subsequent navigation event observed via Strategy 2.
+  // on any subsequent navigation event observed via Strategy 1 / 2.
   const unpatchPush = registerHistoryPushPatch();
   cleanups.push(unpatchPush);
 
@@ -618,12 +709,25 @@ export function registerLibraryPatch(): () => void {
     cleanups.push(unpatchNavigate);
   }
 
-  // ── Strategy 2: routerHook route patch (useLayoutEffect injection) ──
-  // The injected <QuickLaunchAutoLauncher> fires fire() from a
-  // useLayoutEffect, which runs after React commits the DOM but before
-  // the next browser paint.  When this fires Steam's launch animation
-  // typically replaces the overview before any of its content is
-  // visibly committed to the screen.
+  // ── Strategy 1: history.listen (post-commit safety net) ──────────
+  // Pure observer – fires notifyGameSelected without any NavigateBack.
+  // Catches builds where every other strategy misses.  The overview is
+  // briefly visible (until Steam's launch animation kicks in) but the
+  // game still launches – the alternative was nothing happening at all,
+  // which is what users reported in v1.4.0.
+  const unlistenHistory = tryRegisterHistoryListener();
+  if (unlistenHistory) {
+    cleanups.push(unlistenHistory);
+  }
+
+  // ── Strategy 2: routerHook route patch (sync fire + useLayoutEffect) ─
+  // patchLibraryRoute fires fire() synchronously during render with the
+  // appId extracted from the route tree, AND injects an
+  // <QuickLaunchAutoLauncher> component that fires from useLayoutEffect.
+  // Belt-and-suspenders: the synchronous fire works on every Decky
+  // build; the injection runs before paint on builds where the wrapping
+  // element is honoured.  The per-appId debounce in fire() blocks any
+  // double-firing.
   try {
     const patch = routerHook.addPatch(LIBRARY_APP_ROUTE, patchLibraryRoute);
     cleanups.push(() => routerHook.removePatch(LIBRARY_APP_ROUTE, patch));
