@@ -104,26 +104,25 @@ export default definePlugin(() => {
 
   /**
    * Fired by libraryPatch whenever the Steam router navigates to a
-   * game detail page.
+   * game detail page (or, on builds where Strategies 0 / 0b succeed,
+   * before the navigation commits at all).
    *
-   * This function is called synchronously from within the history
-   * listener / route-patch callback, so everything before the first
-   * `await` runs in the same call-stack as the navigation event.
+   * Called synchronously from within the push-intercept patch or
+   * Strategy 2's `useLayoutEffect`, so everything before the first
+   * `await` runs in the same call-stack as the navigation event –
+   * `RunGame` is issued before the next browser paint.
    *
    * Step 1 – prepareBypass() [synchronous]:
-   *   Checks install state, shows any needed toast, and calls
-   *   NavigateBack() immediately so the overview page never renders.
+   *   Checks install state and shows any needed toast.
    *
    * Step 2 – bypassAndLaunch() [async, fire-and-forget]:
-   *   Issues the RunGame command (and, in a future task, retries if
-   *   the API is not yet ready).
-   */
-  /**
-   * @param navigate  true  → navigation already committed; must NavigateBack.
-   *                  false → push was blocked; skip NavigateBack.
+   *   Issues the RunGame command (with a 200 ms retry if SteamClient
+   *   was not yet ready).  Steam's launch animation then replaces
+   *   the overview / library on its own – no NavigateBack required.
+   *
    * @returns true if bypass was applied, false if aborted.
    */
-  function onGameSelected(appId: number, navigate: boolean): boolean {
+  function onGameSelected(appId: number): boolean {
     if (!isEnabled()) {
       console.log(
         `[QuickLaunch] Game ${appId} selected but plugin is disabled – passing through.`
@@ -131,8 +130,8 @@ export default definePlugin(() => {
       return false;
     }
 
-    // Step 1: synchronous — state-check, toast, optional NavigateBack.
-    const shouldLaunch = prepareBypass(appId, navigate);
+    // Step 1: synchronous — state-check, toast.
+    const shouldLaunch = prepareBypass(appId);
     if (!shouldLaunch) return false;
 
     // Step 2: async — RunGame with retry.

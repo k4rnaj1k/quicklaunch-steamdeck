@@ -21,12 +21,16 @@ export type AppId = number;
 /**
  * Fired whenever the user navigates to a game's detail page.
  *
- * @param navigate  true  → caller could not block the navigation; listener
- *                         must call NavigateBack() to dismiss the overview.
- *                  false → caller blocked the push; no NavigateBack needed.
+ * The listener is expected to issue `RunGame` and let Steam's launch
+ * animation cover the overview – we no longer call `NavigateBack` to
+ * dismiss it (that approach created a back-step / library-flash artefact
+ * and raced Steam's render cycle).  Detection strategies are therefore
+ * uniform: whoever sees the navigation calls `notifyGameSelected(appId)`
+ * exactly once and Steam handles the UI transition.
+ *
  * @returns true if the bypass was applied, false if it was aborted.
  */
-export type GameSelectedListener = (appId: AppId, navigate: boolean) => boolean;
+export type GameSelectedListener = (appId: AppId) => boolean;
 
 /** Fired whenever the `enabled` flag changes. */
 export type EnabledChangeListener = (enabled: boolean) => void;
@@ -95,13 +99,12 @@ export function subscribeToEnabled(fn: EnabledChangeListener): () => void {
  * Called by the library route patcher when a game's detail page is
  * about to be (or has been) entered.
  *
- * @param navigate  Passed through to the listener; see GameSelectedListener.
  * @returns The boolean returned by the listener, or false if no listener.
  */
-export function notifyGameSelected(appId: AppId, navigate: boolean): boolean {
+export function notifyGameSelected(appId: AppId): boolean {
   _lastSelectedAppId = appId;
-  console.log(`[QuickLaunch] Game selected: appId=${appId} navigate=${navigate}`);
-  return _onGameSelected?.(appId, navigate) ?? false;
+  console.log(`[QuickLaunch] Game selected: appId=${appId}`);
+  return _onGameSelected?.(appId) ?? false;
 }
 
 /** Register the single game-selection listener (replaces any previous one). */

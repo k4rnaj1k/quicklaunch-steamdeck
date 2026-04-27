@@ -2,17 +2,21 @@
  * gameLauncher.tsx
  *
  * Handles the core "bypass" behaviour: when a game is selected in the
- * Steam Deck library, check its launch state, then immediately launch it
- * and navigate away from the game detail / preview page.
+ * Steam Deck library, check its launch state and immediately launch it.
  *
  * Launch strategy
  * ---------------
  * 1. Call getAppLaunchState() to classify the app (installed? running? etc.)
  * 2. Handle the state:
  *      - not_installed  → abort bypass; show toast; let detail page stay
+ *                          visible so the install button remains usable
  *      - already_running / update_required / launchable / unknown
- *                       → issue RunGame first, then navigate to /library
- * 3. Primary launch: window.SteamClient.Apps.RunGame()  ← called BEFORE NavigateBack
+ *                       → issue RunGame; Steam's launch animation
+ *                          replaces the overview automatically – no
+ *                          NavigateBack required (and the previous
+ *                          NavigateBack-based approach caused the
+ *                          back-step / library-flash artefact)
+ * 3. Primary launch: window.SteamClient.Apps.RunGame()
  *    Fallback launch:  steam://rungameid/<appId> URL scheme
  *
  * Launch type constants
@@ -24,7 +28,6 @@
 
 import React from "react";
 import { toaster } from "@decky/api";
-import { Navigation } from "@decky/ui";
 import { FaRocket } from "react-icons/fa";
 import { getAppLaunchState } from "./appStateChecker";
 import {
@@ -138,23 +141,6 @@ function tryUrlSchemeFallback(appId: number): void {
 }
 
 // ------------------------------------------------------------------ //
-// Navigation                                                           //
-// ------------------------------------------------------------------ //
-
-function navigateToLibrary(): void {
-  try {
-    console.log(
-      "[QuickLaunch] navigateToLibrary: invoking Navigation.NavigateBack()" +
-      ` (Navigation=${typeof Navigation} NavigateBack=${typeof Navigation?.NavigateBack})`
-    );
-    Navigation.NavigateBack();
-    console.log("[QuickLaunch] navigateToLibrary: Navigation.NavigateBack() returned without throwing.");
-  } catch (err) {
-    console.warn("[QuickLaunch] NavigateBack failed:", err);
-  }
-}
-
-// ------------------------------------------------------------------ //
 // Toast helpers                                                        //
 // ------------------------------------------------------------------ //
 
@@ -208,22 +194,19 @@ let _lastLaunchAt    = 0;
 /**
  * Synchronous first half of the bypass.
  *
- * Checks the app's launch state, shows any appropriate toast, and —
- * when navigateBack is true — calls NavigateBack() immediately so the
- * overview page is dismissed before React finishes rendering it.
- *
- * Pass navigateBack=false when the caller has already blocked the
- * history push so the overview was never entered; NavigateBack is then
- * unnecessary and would pop the wrong entry.
+ * Checks the app's launch state and shows any appropriate toast.  No
+ * navigation is performed here – Steam's launch animation will replace
+ * the overview / library when `bypassAndLaunch` issues `RunGame`.
  *
  * Must be called in the same synchronous call-stack as the interception
- * point (history.push patch or history.listen callback).
+ * point (`history.push` patch, `Navigation.Navigate` patch, or the
+ * route-patch `useLayoutEffect`).
  *
- * @param navigateBack  Whether to call NavigateBack() (default true).
  * @returns `true` if the caller should proceed to launch the game,
- *          `false` if the bypass was aborted (game not installed).
+ *          `false` if the bypass was aborted (game not installed, or
+ *          a duplicate fire was debounced).
  */
-export function prepareBypass(appId: number, navigateBack = true): boolean {
+export function prepareBypass(appId: number): boolean {
   // Normalise once, at the earliest synchronous entry point, so every
   // subsequent comparison, lookup, and downstream call works with the
   // unsigned uint32 appId.  Without this the debounce cache would miss
@@ -233,8 +216,7 @@ export function prepareBypass(appId: number, navigateBack = true): boolean {
   appId = toUnsignedAppId(appId);
   console.log(
     `[QuickLaunch] prepareBypass: entry rawAppId=${rawAppId}` +
-    ` normalised=${appId} (0x${appId.toString(16).toUpperCase()})` +
-    ` navigateBack=${navigateBack}`
+    ` normalised=${appId} (0x${appId.toString(16).toUpperCase()})`
   );
   if (rawAppId !== appId) {
     console.warn(
@@ -244,8 +226,10 @@ export function prepareBypass(appId: number, navigateBack = true): boolean {
   }
 
   // Per-appId debounce: suppress only if the same game fires again
-  // within the window (e.g. history-listen + routerHook both trigger).
-  // A different appId always bypasses the guard immediately.
+  // within the window (multiple strategies may observe the same press
+  // – e.g. Strategy 0 catches a push that Strategy 2 then re-observes
+  // when the route renders).  A different appId always bypasses the
+  // guard immediately.
   const now = Date.now();
   if (appId === _lastLaunchAppId && now - _lastLaunchAt < DEBOUNCE_MS) {
     console.log(`[QuickLaunch] prepareBypass debounced for appId=${appId}.`);
@@ -264,7 +248,7 @@ export function prepareBypass(appId: number, navigateBack = true): boolean {
       // Abort: keep the detail page visible so the user can install.
       console.log(
         `[QuickLaunch] prepareBypass: aborting for appId=${appId} – not_installed` +
-        ` (navigateBack=${navigateBack} ignored; detail page kept visible)`
+        " (overview kept visible so the install button remains usable)"
       );
       toastNotInstalled();
       return false;
@@ -285,18 +269,6 @@ export function prepareBypass(appId: number, navigateBack = true): boolean {
       break;
   }
 
-  // ── Navigate back synchronously (fallback strategies only) ──────────
-  // When the history.push was blocked upstream, the user never left the
-  // current page so NavigateBack is not needed (and would be wrong).
-  if (navigateBack) {
-    console.log(`[QuickLaunch] prepareBypass: navigateBack=true – calling navigateToLibrary() for appId=${appId}.`);
-    navigateToLibrary();
-  } else {
-    console.log(
-      `[QuickLaunch] prepareBypass: navigateBack=false – skipping NavigateBack for appId=${appId}` +
-      " (push was blocked upstream; user never left current page)."
-    );
-  }
   console.log(`[QuickLaunch] prepareBypass: returning true for appId=${appId}.`);
   return true;
 }
@@ -312,8 +284,9 @@ export function prepareBypass(appId: number, navigateBack = true): boolean {
  *   3. If both attempts fail, fall back to the steam://rungameid/ URL scheme.
  *
  * The retry handles the case where SteamClient is still initialising
- * when the plugin IIFE first runs; NavigateBack has already fired
- * synchronously so this delay never affects the UI transition.
+ * when the plugin IIFE first runs.  Steam's launch animation will
+ * cover the overview as soon as `RunGame` resolves, so the user sees
+ * a smooth transition into gameplay rather than a back-step pop.
  *
  * @param appId  The Steam appId of the game to launch.
  */
@@ -334,8 +307,9 @@ export async function bypassAndLaunch(appId: number): Promise<void> {
   if (tryRunGameAPI(appId)) return;
 
   // ── Retry after 200 ms ───────────────────────────────────────────
-  // NavigateBack already ran synchronously, so this delay is invisible
-  // to the user.  SteamClient may simply not have been ready yet.
+  // SteamClient may simply not have been ready yet on the first call;
+  // the user sees a brief overview frame, then the launch animation
+  // takes over once the second attempt succeeds.
   console.log(`[QuickLaunch] RunGame unavailable for appId=${appId} – retrying in 200 ms.`);
   await sleep(200);
 

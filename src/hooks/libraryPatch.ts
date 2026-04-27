@@ -4,30 +4,34 @@
  * Detects when the Steam UI navigates to a game's detail page and fires
  * notifyGameSelected() so the bypass logic can run.
  *
- * Four complementary detection strategies are layered so that at least
+ * Three complementary detection strategies are layered so that at least
  * one fires on every SteamOS/Decky version combination:
  *
  *   0.  Router.history.push patch – intercepts the push *before* the
  *       location commits.  The push is swallowed for launchable games so
- *       the overview page is never entered and NavigateBack is not needed.
- *       Best strategy; eliminates the overview flash entirely.
+ *       the overview page is never entered.  Best strategy on builds
+ *       where Steam routes "A on tile" through Router.history.push.
  *
- *   0b. Navigation.Navigate patch – same pre-commit semantics as
- *       Strategy 0, but covers the @decky/ui code path.  Some SteamOS
- *       versions route the "A on tile" action through
- *       Navigation.Navigate(path) rather than Router.history.push(path);
- *       this strategy catches those.  Per-appId debounce in fire()
- *       prevents double-firing if Steam ever calls both for the same press.
+ *   0b. Navigation.Navigate patch – same pre-commit semantics as Strategy
+ *       0, but covers the @decky/ui code path.  Some SteamOS versions
+ *       route the "A on tile" action through Navigation.Navigate(path)
+ *       rather than Router.history.push(path); this strategy catches
+ *       those.  Per-appId debounce in fire() prevents double-firing.
  *
- *   1.  Router.history.listen()  – fires *after* the location changes.
- *       NavigateBack() is required to dismiss the overview.  Fallback when
- *       Strategies 0 / 0b are unavailable or when they let the push through
- *       (not-installed case handled upstream; debounce blocks double-fire).
+ *   2.  routerHook.addPatch() – injects a tiny <QuickLaunchAutoLauncher>
+ *       component into the /library/app/:appid render tree that fires
+ *       `notifyGameSelected` from a useLayoutEffect.  The effect runs
+ *       before paint, so when Steam's launch animation kicks in quickly
+ *       enough the overview content is never visibly committed to the
+ *       screen.  Last-resort fallback when Strategies 0 / 0b miss.
  *
- *   2.  routerHook.addPatch()    – patches the /library/app/:appid route's
- *       render tree.  Fires at render time.  Last-resort fallback.
+ * The previous Strategy 1 (Router.history.listen) has been removed –
+ * it only existed to drive NavigateBack, which we no longer call.
+ * Steam's own launch animation now covers the overview, so post-commit
+ * fallbacks are no longer needed.
  */
 
+import React, { useLayoutEffect } from "react";
 import { routerHook } from "@decky/api";
 import { Router, Navigation } from "@decky/ui";
 import { notifyGameSelected } from "../state/pluginState";
@@ -60,12 +64,9 @@ let _lastFiredAt   = 0;
 /**
  * Debounce-guarded notification.
  *
- * @param navigate  Forwarded to notifyGameSelected / prepareBypass.
- *                  false = push was blocked (no NavigateBack needed).
- *                  true  = navigation already committed (NavigateBack needed).
  * @returns The boolean returned by the game-selected listener.
  */
-function fire(appId: number, source: string, navigate: boolean): boolean {
+function fire(appId: number, source: string): boolean {
   // Normalise at the module boundary so the debounce cache and the
   // downstream listener always work on the uint32 form.  Non-Steam
   // shortcut appIds (>= 0x80000000) may arrive signed-negative when
@@ -83,8 +84,8 @@ function fire(appId: number, source: string, navigate: boolean): boolean {
   if (appId === _lastFiredAppId && now - _lastFiredAt < DEBOUNCE_MS) return false;
   _lastFiredAppId = appId;
   _lastFiredAt    = now;
-  console.log(`[QuickLaunch] bypass triggered appId=${appId} via ${source} navigate=${navigate}`);
-  return notifyGameSelected(appId, navigate);
+  console.log(`[QuickLaunch] bypass triggered appId=${appId} via ${source}`);
+  return notifyGameSelected(appId);
 }
 
 // ------------------------------------------------------------------ //
@@ -120,41 +121,27 @@ function findInTree(
 }
 
 // ------------------------------------------------------------------ //
-// Route patch callback (strategy 2)                                   //
+// AppId extraction (for Strategy 2)                                    //
 // ------------------------------------------------------------------ //
 
-const PATCHED_FLAG = "__qlPatched";
-
-function patchLibraryRoute(tree: unknown): unknown {
-  // A navigation event has reached render-time, which means Router (and
-  // therefore Router.history) must be live by now.  Give Strategy 0 an
-  // opportunity to install itself immediately so subsequent navigations
-  // are caught pre-commit even if the initial backoff attempts all
-  // ran before Router.history was populated.
-  retryHistoryPushPatchNow();
-
-  // ── Approach 1: extractAppId on tree root (React Router v5/v6) ────
+/**
+ * Best-effort appId lookup against the route's render tree.  Returns
+ * 0 if no appId can be located – the caller treats that as "skip".
+ *
+ * Tried in order:
+ *   1. extractAppId() on the tree root (covers React-Router v5/v6
+ *      where the params live on the route element directly).
+ *   2. Deep search for any node carrying `appid` / `appId`, including
+ *      `match.params.appid` for older React-Router shapes.
+ */
+function extractAppIdFromRouteTree(tree: unknown): number {
+  // Approach 1: extractAppId on tree root (React-Router v5/v6).
   const appIdFromRoot = extractAppId([tree]);
   if (appIdFromRoot && appIdFromRoot > 0) {
-    fire(appIdFromRoot, "tree-root", true);
-    return tree;
+    return toUnsignedAppId(appIdFromRoot);
   }
 
-  // ── Approach 2: find renderFunc node and wrap it ──────────────────
-  const routeNode = findInTree(tree, (n) => typeof n["renderFunc"] === "function");
-  if (routeNode && !(routeNode["renderFunc"] as TreeNode)[PATCHED_FLAG]) {
-    const original = routeNode["renderFunc"] as (...args: unknown[]) => unknown;
-    routeNode["renderFunc"] = function (...args: unknown[]) {
-      const ret = original.apply(this as unknown, args);
-      const appId = extractAppId(args);
-      if (appId && appId > 0) fire(appId, "renderFunc-args", true);
-      return ret;
-    };
-    (routeNode["renderFunc"] as TreeNode)[PATCHED_FLAG] = true;
-    return tree;
-  }
-
-  // ── Approach 3: deep-search for any node carrying appid ───────────
+  // Approach 2: deep-search for any node carrying appid info.
   const nodeWithId = findInTree(tree, (n) => {
     const params = n["params"] as TreeNode | undefined;
     const match  = n["match"]  as TreeNode | undefined;
@@ -181,13 +168,74 @@ function patchLibraryRoute(tree: unknown): unknown {
     // a uint32 >= 0x80000000).  Normalise before the zero check so they
     // are accepted here and passed through to fire(), which also
     // normalises defensively.
-    const appId  = isNaN(parsed) ? NaN : toUnsignedAppId(parsed);
-    if (!isNaN(appId) && appId !== 0) fire(appId, "deep-search", true);
-  } else {
-    console.warn("[QuickLaunch] patchLibraryRoute fired but no appId found in tree.");
+    if (!isNaN(parsed)) {
+      const normalised = toUnsignedAppId(parsed);
+      if (normalised !== 0) return normalised;
+    }
   }
 
-  return tree;
+  return 0;
+}
+
+// ------------------------------------------------------------------ //
+// Strategy 2 – <QuickLaunchAutoLauncher> useLayoutEffect injection    //
+// ------------------------------------------------------------------ //
+
+/**
+ * Tiny invisible component injected at the top of the route tree.
+ * Its `useLayoutEffect` fires after React commits the DOM but before
+ * the browser paints the next frame, so on most devices the overview
+ * content is never visibly committed to the screen – Steam's launch
+ * animation replaces it before paint.
+ *
+ * Renders `null` so it adds no DOM, no pixels, no styling impact.
+ *
+ * The effect only re-fires when `appId` changes (React reconciliation
+ * with key=`ql-${appId}` would also force a remount on appId change),
+ * so a route re-render with the same appId does not retrigger fire().
+ * Combined with the per-appId debounce in fire(), this provides two
+ * independent layers of double-trigger protection.
+ */
+const QuickLaunchAutoLauncher: React.FC<{ appId: number }> = ({ appId }) => {
+  useLayoutEffect(() => {
+    if (appId > 0) {
+      console.log(
+        `[QuickLaunch] Strategy 2 (useLayoutEffect): firing for appId=${appId}.`
+      );
+      fire(appId, "useLayoutEffect");
+    }
+  }, [appId]);
+  return null;
+};
+
+// ------------------------------------------------------------------ //
+// Strategy 2 – route patch callback                                    //
+// ------------------------------------------------------------------ //
+
+function patchLibraryRoute(tree: unknown): unknown {
+  // A navigation event has reached render-time, which means Router (and
+  // therefore Router.history) must be live by now.  Give Strategy 0 an
+  // opportunity to install itself immediately so subsequent navigations
+  // are caught pre-commit even if the initial backoff attempts all
+  // ran before Router.history was populated.
+  retryHistoryPushPatchNow();
+
+  const appId = extractAppIdFromRouteTree(tree);
+  if (appId <= 0) {
+    console.warn("[QuickLaunch] patchLibraryRoute fired but no appId found in tree.");
+    return tree;
+  }
+
+  // Inject the auto-launcher above the original tree.  Using a key tied
+  // to the appId guarantees React remounts the component (and re-runs
+  // useLayoutEffect) whenever the user navigates between two different
+  // games without the route element itself unmounting first.
+  return React.createElement(
+    React.Fragment,
+    null,
+    React.createElement(QuickLaunchAutoLauncher, { key: `ql-${appId}`, appId }),
+    tree as React.ReactNode,
+  );
 }
 
 // ------------------------------------------------------------------ //
@@ -199,11 +247,13 @@ function patchLibraryRoute(tree: unknown): unknown {
  * game-page navigations *before* the location commits.
  *
  * When a game route is detected:
- *   • fire() is called with navigate=false (no NavigateBack needed – we
- *     swallow the push entirely so the user never leaves the current page).
- *   • If the bypass succeeds (game is launchable) the push is dropped.
+ *   • fire() is called.
+ *   • If the bypass succeeds (game is launchable) the push is dropped
+ *     and the user never leaves the current page – Steam's launch
+ *     animation takes over.
  *   • If the bypass is aborted (game not installed) the original push
- *     is forwarded so the detail page opens normally.
+ *     is forwarded so the detail page opens normally and the user can
+ *     hit the Install button.
  *
  * Returns a cleanup function that restores the originals, or null if
  * the history object is unavailable.
@@ -266,9 +316,7 @@ function tryPatchHistoryPush(): (() => void) | null {
             ` parsedAppId=${appId}`
           );
           if (appId > 0) {
-            // navigate=false: we are about to block the push, so the
-            // overview page will never be entered and NavigateBack is wrong.
-            const bypassed = fire(appId, "history-push", false);
+            const bypassed = fire(appId, "history-push");
             console.log(
               `[QuickLaunch] Strategy 0: fire() returned bypassed=${bypassed} for appId=${appId}` +
               ` – ${bypassed ? "SWALLOWING" : "forwarding"} ${kind}`
@@ -338,11 +386,11 @@ let _pushPatchAttempt = 0;
  * a cleanup function that cancels pending retries and restores any
  * successfully-installed patch.
  *
- * Additionally, Strategies 1 and 2 call retryHistoryPushPatchNow() when a
- * navigation event fires – by that time Router.history is guaranteed to
- * exist, so the patch can be installed synchronously for any subsequent
- * navigations (the current one will not benefit, but rapid repeat
- * A-presses will).
+ * Additionally, Strategy 2 calls retryHistoryPushPatchNow() when a
+ * navigation event reaches render-time – by that time Router.history is
+ * guaranteed to exist, so the patch can be installed synchronously for
+ * any subsequent navigations (the current one will not benefit, but
+ * rapid repeat A-presses will).
  */
 function registerHistoryPushPatch(): () => void {
   _pushPatchInstalled   = false;
@@ -378,7 +426,7 @@ function registerHistoryPushPatch(): () => void {
       console.warn(
         "[QuickLaunch] Strategy 0 patch: giving up after" +
         ` ${PUSH_PATCH_RETRY_DELAYS_MS.length} attempts.` +
-        " Strategies 1 & 2 will continue to handle game-page detection." +
+        " Strategies 0b & 2 will continue to handle game-page detection." +
         " Navigation events will also trigger one more retry attempt."
       );
       return;
@@ -416,13 +464,13 @@ function registerHistoryPushPatch(): () => void {
 
 /**
  * Attempts an immediate patch install when triggered by a navigation
- * event (from Strategy 1 or 2).  A no-op if the patch is already
- * installed or cleanup has been requested.
+ * event (from Strategy 2).  A no-op if the patch is already installed
+ * or cleanup has been requested.
  *
  * This covers the edge case where Router.history only becomes available
  * after plugin init but before any of the scheduled backoff retries
  * fire – without this path, the very first navigation would still be
- * caught only by Strategies 1/2 (post-commit, overview flashes).
+ * caught only by Strategy 2.
  */
 function retryHistoryPushPatchNow(): void {
   if (_pushPatchInstalled || _pushPatchCancelled) return;
@@ -445,7 +493,7 @@ function retryHistoryPushPatchNow(): void {
   } else {
     console.warn(
       "[QuickLaunch] Strategy 0 patch: navigation-triggered retry still could not install patch." +
-      " Continuing with Strategies 1 & 2."
+      " Continuing with Strategies 0b & 2."
     );
   }
 }
@@ -457,14 +505,8 @@ function retryHistoryPushPatchNow(): void {
 /**
  * Some SteamOS / @decky/ui versions route the "A on tile" action through
  * `Navigation.Navigate(path)` rather than `Router.history.push(path)`.
- * Strategy 0 misses this entirely, leaving Strategies 1 / 2 to clean up
- * post-commit – which is exactly the flash the user reports.
- *
- * This patch wraps `Navigation.Navigate` with the same intercept logic
- * as Strategy 0: if the destination is a game-detail route, we fire the
- * bypass with `navigate=false` (so no NavigateBack is needed) and swallow
- * the call when the bypass succeeds.  Otherwise the call is forwarded
- * unchanged.
+ * Strategy 0 misses this entirely; Strategy 0b catches it with the same
+ * pre-commit semantics.
  *
  * The patch is additive – Strategy 0 stays in place, both can coexist
  * without interfering (the per-appId debounce in `fire()` blocks any
@@ -514,9 +556,7 @@ function tryPatchNavigationNavigate(): (() => void) | null {
             ` parsedAppId=${appId}`
           );
           if (appId > 0) {
-            // navigate=false: we are about to block the call, so the
-            // overview page is never entered and NavigateBack is wrong.
-            const bypassed = fire(appId, "navigation-navigate", false);
+            const bypassed = fire(appId, "navigation-navigate");
             console.log(
               `[QuickLaunch] Strategy 0b: fire() returned bypassed=${bypassed} for appId=${appId}` +
               ` – ${bypassed ? "SWALLOWING" : "forwarding"} Navigation.Navigate`
@@ -550,60 +590,6 @@ function tryPatchNavigationNavigate(): (() => void) | null {
 }
 
 // ------------------------------------------------------------------ //
-// Strategy 1 – Router.history.listen()                                //
-// ------------------------------------------------------------------ //
-
-function tryRegisterHistoryListener(): (() => void) | null {
-  try {
-    // @decky/ui v4+ exposes the React-Router instance as `Router`.
-    // Its `.history` is a MemoryHistory whose pathname reflects the
-    // current in-app route (window.location doesn't change on the Deck).
-    const history = (Router as unknown as Record<string, unknown>)?.["history"];
-    if (!history || typeof (history as Record<string, unknown>)["listen"] !== "function") {
-      console.warn("[QuickLaunch] Router.history.listen not available.");
-      return null;
-    }
-
-    // React-Router v5 history.listen signature:
-    //   listen((location: Location, action: Action) => void): UnregisterCallback
-    const unlisten = (history as { listen: (cb: (loc: unknown) => void) => () => void }).listen(
-      (location: unknown) => {
-        // A navigation event has fired – Router.history is demonstrably
-        // alive.  Give Strategy 0 a chance to install itself right now so
-        // subsequent navigations are caught pre-commit.
-        retryHistoryPushPatchNow();
-
-        // location may be a Location object or a string depending on RR version.
-        const pathname =
-          typeof location === "string"
-            ? location
-            : (location as Record<string, unknown>)?.["pathname"] as string | undefined;
-
-        if (!pathname) return;
-
-        const m = pathname.match(GAME_ROUTE_RE);
-        if (!m) return;
-
-        const appId = parseInt(m[1], 10);
-        // history.listen fires after the push commits → NavigateBack needed.
-        if (appId > 0) fire(appId, "history-listen", true);
-      }
-    );
-
-    if (typeof unlisten !== "function") {
-      console.warn("[QuickLaunch] Router.history.listen did not return a cleanup fn.");
-      return null;
-    }
-
-    console.log("[QuickLaunch] Router.history.listen registered.");
-    return unlisten;
-  } catch (err) {
-    console.warn("[QuickLaunch] tryRegisterHistoryListener error:", err);
-    return null;
-  }
-}
-
-// ------------------------------------------------------------------ //
 // Public API                                                           //
 // ------------------------------------------------------------------ //
 
@@ -612,12 +598,12 @@ export function registerLibraryPatch(): () => void {
 
   // ── Strategy 0: patch history.push/replace (pre-commit, best) ────
   // Intercepts navigation before the location commits, so the overview
-  // page is never entered and NavigateBack is not needed.
+  // page is never entered.
   //
   // registerHistoryPushPatch() returns a cleanup unconditionally: if the
   // initial patch attempt fails (Router.history not yet available at
   // plugin IIFE time), it schedules retries with backoff AND re-attempts
-  // on any subsequent navigation event observed via Strategies 1 or 2.
+  // on any subsequent navigation event observed via Strategy 2.
   const unpatchPush = registerHistoryPushPatch();
   cleanups.push(unpatchPush);
 
@@ -632,16 +618,12 @@ export function registerLibraryPatch(): () => void {
     cleanups.push(unpatchNavigate);
   }
 
-  // ── Strategy 1: history.listen (post-commit fallback) ────────────
-  // Fires after the location has changed; NavigateBack is required.
-  // Registered even when Strategy 0 succeeded – the per-appId debounce
-  // prevents double-firing since a blocked push never changes the location.
-  const unlistenHistory = tryRegisterHistoryListener();
-  if (unlistenHistory) {
-    cleanups.push(unlistenHistory);
-  }
-
-  // ── Strategy 2: routerHook route patch (render-time fallback) ────
+  // ── Strategy 2: routerHook route patch (useLayoutEffect injection) ──
+  // The injected <QuickLaunchAutoLauncher> fires fire() from a
+  // useLayoutEffect, which runs after React commits the DOM but before
+  // the next browser paint.  When this fires Steam's launch animation
+  // typically replaces the overview before any of its content is
+  // visibly committed to the screen.
   try {
     const patch = routerHook.addPatch(LIBRARY_APP_ROUTE, patchLibraryRoute);
     cleanups.push(() => routerHook.removePatch(LIBRARY_APP_ROUTE, patch));
